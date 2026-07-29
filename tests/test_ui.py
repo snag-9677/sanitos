@@ -60,10 +60,10 @@ class StubEditor:
 @pytest.fixture()
 def ui() -> EditorUI:
     from src.device import detect_device
-    from src.model_loader import QwenEditModel
+    from src.model_loader import EditModel
 
     cfg = load_config()
-    model = QwenEditModel(repo_id=cfg.model.repo_id, cache_dir=cfg.model.cache_dir)
+    model = EditModel(repo_id=cfg.model.repo_id, cache_dir=cfg.model.cache_dir)
     instance = EditorUI(cfg, detect_device(), model)
     instance.editor = StubEditor()
     return instance

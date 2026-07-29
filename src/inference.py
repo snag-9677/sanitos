@@ -23,7 +23,7 @@ from typing import Any, Callable, Sequence
 from PIL import Image
 
 from .device import active_memory_gb, peak_memory_gb, reset_peak_memory
-from .model_loader import ModelLoadError, QwenEditModel
+from .model_loader import EditModel, ModelLoadError
 from .utils import coerce_seed, estimate_remaining, format_duration, snap_dimension
 
 logger = logging.getLogger(__name__)
@@ -52,7 +52,7 @@ class EditRequest:
     width: int | None = None
     height: int | None = None
     negative_prompt: str = ""
-    scheduler: str = "linear"
+    scheduler: str = ""
 
     def __post_init__(self) -> None:
         if not self.images:
@@ -128,7 +128,7 @@ class _GenerationCallback:
 
     def __init__(
         self,
-        model_handle: QwenEditModel,
+        model_handle: EditModel,
         total_steps: int,
         on_progress: ProgressFn | None,
         cancel_event: threading.Event | None,
@@ -165,8 +165,12 @@ class _GenerationCallback:
         This is exactly the moment the text encoder becomes dead weight for the
         rest of the run, so ``low`` mode releases its 15.5 GB here.
         """
+        # Normally a no-op: the encode barrier in ImageEditor already evicted
+        # after forcing the embeddings. This is the fallback if that patch
+        # could not be installed against this mflux version.
         if self.model_handle.memory_mode == "low":
             self.model_handle.evict_text_encoder()
+        logger.debug("Entering denoise loop at %.1f GB active", active_memory_gb())
         self._emit(EditProgress(0, self.total_steps, 0.0, message="Denoising…"))
 
     def call_in_loop(self, t, seed, prompt, latents, config, time_steps) -> None:
@@ -219,25 +223,50 @@ class _GenerationCallback:
             logger.debug("Progress callback raised: %s", exc)
 
 
-def decode_latents(model_handle: QwenEditModel, latents: Any, config: Any) -> Image.Image:
+def decode_latents(model_handle: EditModel, latents: Any, config: Any) -> Image.Image:
     """Turn packed latents into a PIL image using the model's VAE.
 
+    Used for mid-run previews and for salvaging a stopped generation. Latent
+    packing differs by family, so the unpack step is dispatched on
+    ``family.decode_kind``.
+
     Uses the already-resident model rather than ``ensure_loaded()``. In ``low``
-    mode the text encoder has just been evicted on purpose, and going through
-    ensure_loaded() would drag its 15.5 GB straight back in — on every preview
+    mode the text encoder may have just been evicted on purpose, and going
+    through ensure_loaded() would drag it straight back in — on every preview
     decode, mid-generation. Only the VAE is needed here.
     """
-    from mflux.models.common.vae.vae_util import VAEUtil
-    from mflux.models.qwen.latent_creator.qwen_latent_creator import QwenLatentCreator
     from mflux.utils.image_util import ImageUtil
 
     model = model_handle.live_model
-    unpacked = QwenLatentCreator.unpack_latents(
-        latents=latents, height=config.height, width=config.width
-    )
-    decoded = VAEUtil.decode(
-        vae=model.vae, latent=unpacked, tiling_config=getattr(model, "tiling_config", None)
-    )
+    kind = model_handle.family.decode_kind
+
+    if kind == "qwen":
+        from mflux.models.common.vae.vae_util import VAEUtil
+        from mflux.models.qwen.latent_creator.qwen_latent_creator import QwenLatentCreator
+
+        unpacked = QwenLatentCreator.unpack_latents(
+            latents=latents, height=config.height, width=config.width
+        )
+        decoded = VAEUtil.decode(
+            vae=model.vae,
+            latent=unpacked,
+            tiling_config=getattr(model, "tiling_config", None),
+        )
+    else:
+        # FLUX.2 keeps latents as (batch, patches, channels); the patch grid is
+        # height/16 x width/16 (VAE stride 8, then 2x2 patching).
+        latent_height = config.height // 16
+        latent_width = config.width // 16
+        if latent_height * latent_width != latents.shape[1]:
+            raise ValueError(
+                f"Latent grid {latent_height}x{latent_width} does not match "
+                f"{latents.shape[1]} patches; cannot decode."
+            )
+        packed = latents.reshape(
+            latents.shape[0], latent_height, latent_width, latents.shape[-1]
+        ).transpose(0, 3, 1, 2)
+        decoded = model.vae.decode_packed_latents(packed)
+
     normalised = ImageUtil._denormalize(decoded)
     return ImageUtil._numpy_to_pil(ImageUtil._to_numpy(normalised))
 
@@ -245,7 +274,7 @@ def decode_latents(model_handle: QwenEditModel, latents: Any, config: Any) -> Im
 class ImageEditor:
     """Runs text-guided edits against the loaded model."""
 
-    def __init__(self, model_handle: QwenEditModel, *, enable_previews: bool = True) -> None:
+    def __init__(self, model_handle: EditModel, *, enable_previews: bool = True) -> None:
         self.model_handle = model_handle
         self.enable_previews = enable_previews
         self._lock = threading.Lock()
@@ -319,12 +348,14 @@ class ImageEditor:
         registry.register(callback)
 
         started = time.perf_counter()
+        restore = self._install_encode_barrier(model)
         try:
             with tempfile.TemporaryDirectory(prefix="qwen-edit-") as tmp:
                 # mflux takes image paths, not PIL objects.
                 image_paths = self._write_inputs(request.images, Path(tmp))
                 result = self._generate(model, request, image_paths, callback, started)
         finally:
+            restore()
             self._reset_registry(registry)
             self.model_handle.after_generation()
 
@@ -352,19 +383,23 @@ class ImageEditor:
         except ImportError:  # pragma: no cover - mflux always ships this
             StopImageGenerationException = RuntimeError  # type: ignore[assignment]
 
+        # Families differ in which kwargs they accept — FLUX.2 errors on a
+        # negative prompt, Qwen requires one path for metadata — so the family
+        # assembles the call.
+        kwargs = self.model_handle.family.build_generate_kwargs(
+            seed=request.seed,
+            prompt=request.instruction,
+            image_paths=image_paths,
+            steps=request.steps,
+            guidance=request.guidance,
+            width=request.width,
+            height=request.height,
+            negative_prompt=request.negative_prompt,
+            scheduler=request.scheduler or None,
+        )
+
         try:
-            generated = model.generate_image(
-                seed=request.seed,
-                prompt=request.instruction,
-                image_paths=image_paths,
-                image_path=image_paths[0],
-                num_inference_steps=request.steps,
-                guidance=request.guidance,
-                width=request.width,
-                height=request.height,
-                negative_prompt=request.negative_prompt or None,
-                scheduler=request.scheduler,
-            )
+            generated = model.generate_image(**kwargs)
         except StopImageGenerationException:
             return self._salvage(request, callback, started)
         except KeyboardInterrupt:
@@ -430,6 +465,64 @@ class ImageEditor:
             completed_steps=callback.completed_steps,
             peak_memory_gb=peak_memory_gb(),
         )
+
+    def _install_encode_barrier(self, model: Any) -> Callable[[], None]:
+        """Force the text encoder to run, then free it, before denoising starts.
+
+        This is the single most important optimisation in the app on a machine
+        with less memory than the model.
+
+        MLX is lazily evaluated. ``_encode_prompts_with_images`` returns an
+        *unevaluated graph*, not embeddings — and that graph holds a reference
+        to every one of the text encoder's 15.5 GB of weights. Dropping the
+        module afterwards therefore frees nothing: the weights stay alive until
+        the graph is finally forced, which happens at the first ``mx.eval()``
+        inside the denoise loop, exactly when the 16.6 GB transformer is also
+        materialising. Both are resident at once, peak hits ~32 GB, and a 24 GB
+        machine swaps for the entire run.
+
+        Measured on an M5/24 GB: 116 s/step without this barrier.
+
+        Inserting an explicit ``mx.eval`` on the embeddings collapses the graph
+        while the transformer is still untouched, so the encoder's weights can
+        actually be released. The embeddings themselves are a few MB.
+
+        Returns a callable that restores the original method.
+        """
+        method = self.model_handle.family.encode_method
+        original = getattr(model, method, None)
+        if original is None or self.model_handle.memory_mode == "off":
+            return lambda: None
+
+        try:
+            import mlx.core as mx
+        except ImportError:
+            return lambda: None
+
+        handle = self.model_handle
+
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            result = original(*args, **kwargs)
+            try:
+                arrays = [a for a in result if a is not None]
+                mx.eval(*arrays)  # collapse the graph; weights become droppable
+            except Exception as exc:  # noqa: BLE001 - never break generation
+                logger.debug("Could not force prompt-embedding evaluation: %s", exc)
+                return result
+
+            if handle.memory_mode == "low":
+                handle.evict_text_encoder()
+            return result
+
+        setattr(model, method, wrapped)
+
+        def restore() -> None:
+            try:
+                setattr(model, method, original)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Could not restore the encode method: %s", exc)
+
+        return restore
 
     @staticmethod
     def _write_inputs(images: Sequence[Image.Image], directory: Path) -> list[str]:

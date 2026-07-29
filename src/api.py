@@ -27,7 +27,7 @@ from PIL import Image
 from .config import AppConfig
 from .device import active_memory_gb, detect_device, peak_memory_gb
 from .inference import EditRequest, ImageEditor, InferenceError
-from .model_loader import QwenEditModel
+from .model_loader import EditModel
 from .utils import ImageError, coerce_seed, load_image
 
 logger = logging.getLogger(__name__)
@@ -48,7 +48,7 @@ def _decode_image(payload: str | bytes) -> Image.Image:
         raise ImageError(f"Could not decode image: {exc}") from exc
 
 
-def mount_api(demo: Any, config: AppConfig, model: QwenEditModel) -> None:
+def mount_api(demo: Any, config: AppConfig, model: EditModel) -> None:
     """Attach REST routes to the FastAPI app behind the Gradio Blocks.
 
     Failures here are logged and swallowed: a broken optional API must never

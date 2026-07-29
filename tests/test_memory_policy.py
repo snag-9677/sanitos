@@ -14,7 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.model_loader import ModelLoadError, QwenEditModel, verify_weights  # noqa: E402
+from src.model_loader import ModelLoadError, EditModel, verify_weights  # noqa: E402
 
 
 class FakeModel:
@@ -30,13 +30,13 @@ class FakeModel:
 
 
 @pytest.fixture()
-def handle(tmp_path: Path) -> QwenEditModel:
-    model = QwenEditModel(repo_id="fake/repo", cache_dir=tmp_path, memory_mode="low")
+def handle(tmp_path: Path) -> EditModel:
+    model = EditModel(repo_id="fake/repo", cache_dir=tmp_path, memory_mode="low")
     model._model = FakeModel()
     return model
 
 
-def test_evict_frees_only_the_text_encoder(handle: QwenEditModel) -> None:
+def test_evict_frees_only_the_text_encoder(handle: EditModel) -> None:
     handle.evict_text_encoder()
 
     live = handle._model
@@ -49,13 +49,13 @@ def test_evict_frees_only_the_text_encoder(handle: QwenEditModel) -> None:
     assert live.tokenizers["qwen"] is not None
 
 
-def test_evict_is_idempotent(handle: QwenEditModel) -> None:
+def test_evict_is_idempotent(handle: EditModel) -> None:
     handle.evict_text_encoder()
     handle.evict_text_encoder()
     assert handle._encoder_evicted is True
 
 
-def test_live_model_does_not_trigger_a_reload(handle: QwenEditModel) -> None:
+def test_live_model_does_not_trigger_a_reload(handle: EditModel) -> None:
     """Preview decoding must not resurrect the evicted text encoder.
 
     ``ensure_loaded()`` deliberately reloads the encoder; ``live_model`` must
@@ -79,12 +79,12 @@ def test_live_model_does_not_trigger_a_reload(handle: QwenEditModel) -> None:
 
 
 def test_live_model_raises_when_nothing_is_loaded(tmp_path: Path) -> None:
-    model = QwenEditModel(repo_id="fake/repo", cache_dir=tmp_path)
+    model = EditModel(repo_id="fake/repo", cache_dir=tmp_path)
     with pytest.raises(ModelLoadError):
         _ = model.live_model
 
 
-def test_balanced_mode_is_not_evicted_by_the_callback(handle: QwenEditModel) -> None:
+def test_balanced_mode_is_not_evicted_by_the_callback(handle: EditModel) -> None:
     """Only low mode should release the encoder."""
     from src.inference import _GenerationCallback
 
@@ -95,7 +95,7 @@ def test_balanced_mode_is_not_evicted_by_the_callback(handle: QwenEditModel) -> 
     assert handle._model.text_encoder is not None
 
 
-def test_low_mode_evicts_via_the_callback(handle: QwenEditModel) -> None:
+def test_low_mode_evicts_via_the_callback(handle: EditModel) -> None:
     from src.inference import _GenerationCallback
 
     callback = _GenerationCallback(handle, 25, None, None, enable_previews=False)
@@ -104,7 +104,7 @@ def test_low_mode_evicts_via_the_callback(handle: QwenEditModel) -> None:
     assert handle._model.text_encoder is None
 
 
-def test_cancel_flag_raises_keyboard_interrupt(handle: QwenEditModel) -> None:
+def test_cancel_flag_raises_keyboard_interrupt(handle: EditModel) -> None:
     """mflux turns KeyboardInterrupt into a stop that preserves the latents."""
     import threading
 

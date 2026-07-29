@@ -96,12 +96,16 @@ def main() -> int:
 
     # Route HuggingFace at the project model directory *before* anything
     # imports huggingface_hub, which snapshots these into constants on import.
-    from src.model_loader import MODEL_LABEL, QwenEditModel, is_model_cached
+    from src.families import get_family
+    from src.model_loader import EditModel, is_model_cached
 
-    print(startup_banner(device, MODEL_LABEL, config.memory.mode))
+    family = get_family(config.model.family)
+    print(startup_banner(device, family.label, config.memory.mode, family.working_set_gb))
 
-    cached = is_model_cached(config.model.repo_id, config.model.cache_dir)
-    print(f"  Weights       {'cached' if cached else 'not downloaded yet (~32 GB on first edit)'}")
+    cached = is_model_cached(config.model.repo_id, config.model.cache_dir, family)
+    size_note = f"not downloaded yet (~{family.working_set_gb:.0f} GB on first edit)"
+    print(f"  Weights       {'cached' if cached else size_note}")
+    print(f"  Repo          {config.model.repo_id}")
     print(f"  Model dir     {config.model.cache_dir}")
     print(f"  Outputs       {config.output.dir}")
     print()
@@ -124,6 +128,7 @@ def main() -> int:
             download_model(
                 config.model.repo_id,
                 config.model.cache_dir,
+                family=family,
                 workers=args.jobs,
                 disable_xet=args.no_xet or None,
                 endpoint=args.mirror,
@@ -160,10 +165,10 @@ def main() -> int:
             return 1
 
         from mflux.models.common.resolution.path_resolution import PathResolution
-        from mflux.models.qwen.weights.qwen_weight_definition import QwenWeightDefinition
 
         root = PathResolution.resolve(
-            path=config.model.repo_id, patterns=QwenWeightDefinition.get_download_patterns()
+            path=config.model.repo_id,
+            patterns=family.load_weight_definition().get_download_patterns(),
         )
         problems = verify_weights(Path(root)) if root else ["Could not resolve the model directory."]
         if problems:
@@ -182,9 +187,10 @@ def main() -> int:
         print("  ✅ Ready to run.")
         return 0
 
-    model = QwenEditModel(
+    model = EditModel(
         repo_id=config.model.repo_id,
         cache_dir=config.model.cache_dir,
+        family=family,
         memory_mode=config.memory.mode,
         cache_limit_bytes=config.memory.cache_limit_bytes,
         vae_tiling=config.memory.vae_tiling,

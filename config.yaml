@@ -4,17 +4,26 @@
 # file's directory, so the project stays portable.
 
 model:
-  # Pre-quantized 6-bit Qwen-Image-Edit-2509 in mflux/MLX format.
+  # FLUX.2 Klein 9B at 8-bit, in mflux/MLX format.
   # Accepts a HuggingFace repo id ("org/name") or a local directory.
   #
-  # Note: Norton0924/Qwen-Image-Edit-2509-6bit is the other 6-bit export, but
-  # its text_encoder/2.safetensors is truncated upstream (67 MB against a
-  # header declaring 2.06 GB), so it cannot load. Run `python app.py --verify`
-  # if you swap this for another repo.
-  repo_id: "OsaurusAI/Qwen-Image-Edit-mflux-q6"
+  # Chosen because every component is quantised — including the text encoder —
+  # so the whole 17.9 GB model stays resident on a 24 GB machine.
+  #
+  # Qwen-Image-Edit is still supported (family: qwen-image-edit), but mflux
+  # keeps its text encoder at bf16, which puts the working set at ~32 GB and
+  # causes heavy swapping below 40 GB of memory. Measured on an M5/24 GB:
+  # 116 s per denoise step, versus a few seconds for this model.
+  repo_id: "mlx-community/flux2-klein-9b-8bit"
+
+  # Which mflux pipeline drives this repo. See src/families.py.
+  #   flux2-klein-edit     FLUX.2 Klein 9B   ~17.9 GB   (default)
+  #   flux2-klein-edit-4b  FLUX.2 Klein 4B    ~6.7 GB   fastest
+  #   qwen-image-edit      Qwen-Image-Edit   ~32.4 GB   needs 40 GB+
+  family: "flux2-klein-edit"
 
   # Where weights are cached. This becomes HF_HOME, so downloads land inside
-  # the project instead of ~/.cache/huggingface. ~32 GB on first launch.
+  # the project instead of ~/.cache/huggingface. ~18 GB on first launch.
   cache_dir: "./models/hf"
 
   # Bit width is read from the model's own safetensors metadata. Leave null to
@@ -31,17 +40,16 @@ model:
   lora_scales: []
 
 memory:
-  # How aggressively to manage the ~32 GB working set (16.6 GB 6-bit
-  # transformer + 15.5 GB bf16 text encoder) on a 24 GB machine.
+  # How to manage the working set. FLUX.2 Klein 9B is 17.9 GB, which fits in
+  # 24 GB with headroom, so nothing needs evicting.
   #
-  #   balanced  Keep every component resident. Fastest per-edit once warm;
-  #             relies on macOS paging the idle text encoder out during
-  #             denoising. Recommended for 32 GB+.
+  #   balanced  Keep every component resident. Correct whenever the model fits
+  #             in memory — no eviction, no reload, fastest per edit.
   #   low       Evict the text encoder after each prompt encode and lazily
-  #             reload it next turn. Peak ~17 GB. Costs a reload (~10-25 s)
-  #             on turns that re-encode. Recommended for 24 GB.
+  #             reload it next turn. Only worth it when the model does not fit
+  #             (i.e. family: qwen-image-edit on under ~40 GB).
   #   off       No management at all.
-  mode: "low"
+  mode: "balanced"
 
   # Cap on MLX's buffer cache. MLX otherwise retains freed GPU buffers
   # indefinitely across sequential denoise passes. Bytes; null disables.
@@ -52,13 +60,15 @@ memory:
 
 generation:
   # Defaults for the UI. Everything here is overridable per-edit.
-  steps: 25
-  guidance: 4.0
+  # FLUX.2 wants guidance near 1.0 — unlike Qwen, which likes ~4.0. It also
+  # rejects a negative prompt entirely; describe what you want instead.
+  steps: 28
+  guidance: 1.0
   # null = derive from the input image's aspect ratio at ~1 megapixel.
   width: null
   height: null
   negative_prompt: ""
-  scheduler: "linear"
+  scheduler: "flow_match_euler_discrete"
 
   # Resolution presets offered in the UI.
   #
@@ -77,8 +87,8 @@ generation:
 
   # Shown in the UI as the recommended starting point for this machine.
   m5_recommended:
-    steps: 25
-    guidance: 4.0
+    steps: 28
+    guidance: 1.0
     preset: "Balanced — match input, 0.6 MP"
 
 output:
@@ -90,7 +100,7 @@ output:
   format: "png"
 
 ui:
-  title: "Qwen Image Edit — M5"
+  title: "Local Image Edit — M5"
   server_name: "127.0.0.1"
   server_port: 7860
   share: false

@@ -31,7 +31,7 @@ from .inference import (
     InferenceError,
     memory_snapshot,
 )
-from .model_loader import QwenEditModel, is_model_cached
+from .model_loader import EditModel, is_model_cached
 from .session import EditSession
 from .utils import (
     ImageError,
@@ -67,7 +67,7 @@ def launch_style() -> dict[str, Any]:
 class EditorUI:
     """Builds the Gradio app and owns the per-tab state wiring."""
 
-    def __init__(self, config: AppConfig, device: DeviceInfo, model: QwenEditModel) -> None:
+    def __init__(self, config: AppConfig, device: DeviceInfo, model: EditModel) -> None:
         self.config = config
         self.device = device
         self.model = model
@@ -717,5 +717,5 @@ class EditorUI:
         return demo
 
 
-def build_ui(config: AppConfig, device: DeviceInfo, model: QwenEditModel) -> gr.Blocks:
+def build_ui(config: AppConfig, device: DeviceInfo, model: EditModel) -> gr.Blocks:
     return EditorUI(config, device, model).build()

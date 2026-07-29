@@ -1,19 +1,21 @@
-"""Loading and memory management for the 6-bit Qwen-Image-Edit model.
+"""Loading and memory management for the editing model.
 
-Memory is the whole problem on a 24 GB machine. The model splits into:
+Memory is the whole problem when the model is larger than the machine. The
+per-family footprints live in ``families.py``; the two that matter here:
 
-    transformer    16.6 GB   6-bit packed (U32 weights + bf16 scales/biases)
-    text encoder   15.5 GB   bf16, deliberately NOT quantised -- mflux marks it
-                             skip_quantization because 6-bit noticeably degrades
-                             prompt understanding
-    VAE             0.25 GB  bf16
-                   -------
-                   ~32 GB    working set
+    FLUX.2 Klein 9B (8-bit)   transformer 9.6 + text encoder 8.0 + vae 0.2
+                              = ~17.9 GB, everything quantised, fully resident
+                              on a 24 GB machine.
 
-The text encoder only runs at the start of an edit; the transformer runs for
-every denoise step. So ``low`` mode evicts the encoder once the prompt is
-encoded and lazily reloads it on the next turn, which keeps the long denoising
-phase inside ~17 GB.
+    Qwen-Image-Edit (6-bit)   transformer 16.6 + text encoder 15.5 (bf16, mflux
+                              marks it skip_quantization) + vae 0.25 = ~32.4 GB.
+                              Needs 40 GB+ or it swaps.
+
+When the working set does not fit, ``low`` mode evicts the text encoder once
+the prompt is encoded and lazily reloads it next turn, bounding the denoise
+phase to the transformer alone. Crucially the eviction only works if the
+encoder's lazily-evaluated output graph is forced first — see
+``ImageEditor._install_encode_barrier``.
 
 mflux's own MemorySaver does the eviction but never reloads, so a second edit
 with a new prompt would crash. This module owns that lifecycle instead.
@@ -30,9 +32,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-logger = logging.getLogger(__name__)
+from .families import ModelFamily, get_family
 
-MODEL_LABEL = "Qwen-Image-Edit-2509 — 6-bit (MLX)"
+logger = logging.getLogger(__name__)
 
 
 class ModelLoadError(RuntimeError):
@@ -66,14 +68,19 @@ def configure_hf_cache(cache_dir: Path) -> None:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
-class QwenEditModel:
-    """Lazily-loaded, thread-safe handle to the mflux ``QwenImageEdit`` model."""
+class EditModel:
+    """Lazily-loaded, thread-safe handle to an mflux editing pipeline.
+
+    Which pipeline is decided by the configured :class:`ModelFamily`.
+    """
 
     def __init__(
         self,
         repo_id: str,
         cache_dir: Path,
         *,
+        family: str | ModelFamily = "flux2-klein-edit",
+        label: str | None = None,
         memory_mode: str = "low",
         cache_limit_bytes: int | None = 1024**3,
         vae_tiling: bool = True,
@@ -83,6 +90,8 @@ class QwenEditModel:
     ) -> None:
         self.repo_id = repo_id
         self.cache_dir = cache_dir
+        self.family = family if isinstance(family, ModelFamily) else get_family(family)
+        self._label = label
         self.memory_mode = memory_mode
         self.cache_limit_bytes = cache_limit_bytes
         self.vae_tiling = vae_tiling
@@ -123,7 +132,7 @@ class QwenEditModel:
 
     @property
     def label(self) -> str:
-        return MODEL_LABEL
+        return self._label or self.family.label
 
     # --------------------------------------------------------------- loading
 
@@ -142,27 +151,29 @@ class QwenEditModel:
             started = time.perf_counter()
 
             try:
-                from mflux.models.common.config import ModelConfig
-                from mflux.models.qwen.variants.edit.qwen_image_edit import QwenImageEdit
+                pipeline_class = self.family.load_pipeline_class()
+                model_config = self.family.load_model_config()
             except ImportError as exc:
                 raise ModelLoadError(
-                    "mflux is not installed. Run: pip install -r requirements.txt"
+                    f"Could not load the {self.family.label} pipeline. Is mflux "
+                    f"installed and recent enough? Run: pip install -r requirements.txt\n{exc}"
                 ) from exc
 
             self._apply_mlx_limits()
             self._report(
                 progress,
                 "Loading weights",
-                "~32 GB on first run — this downloads once, then caches",
+                f"~{self.family.working_set_gb:.0f} GB on first run — "
+                "this downloads once, then caches",
             )
 
             try:
-                model = QwenImageEdit(
+                model = pipeline_class(
                     quantize=self.quantize,
                     model_path=self.repo_id,
                     lora_paths=self.lora_paths or None,
                     lora_scales=self.lora_scales or None,
-                    model_config=ModelConfig.qwen_image_edit(),
+                    model_config=model_config,
                 )
             except Exception as exc:  # noqa: BLE001 - surface a usable message
                 raise ModelLoadError(self._explain_load_failure(exc, self.repo_id)) from exc
@@ -179,11 +190,10 @@ class QwenEditModel:
             logger.info(
                 "Model ready in %.1fs (quantisation: %s-bit)", self._load_seconds, bits
             )
-            if bits != 6:
+            if bits is None:
                 logger.warning(
-                    "Expected 6-bit weights but the model reports %s-bit. Check "
-                    "that model.repo_id points at a 6-bit mflux export.",
-                    bits,
+                    "The weights report no quantisation level — this may be a "
+                    "bf16 export, which will need far more memory than expected."
                 )
 
             self._report(progress, "Ready", f"{self._load_seconds:.1f}s")
@@ -193,12 +203,10 @@ class QwenEditModel:
         """Local directory the weights were resolved from (for partial reloads)."""
         try:
             from mflux.models.common.resolution.path_resolution import PathResolution
-            from mflux.models.qwen.weights.qwen_weight_definition import (
-                QwenWeightDefinition,
-            )
 
             return PathResolution.resolve(
-                path=self.repo_id, patterns=QwenWeightDefinition.get_download_patterns()
+                path=self.repo_id,
+                patterns=self.family.load_weight_definition().get_download_patterns(),
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("Could not resolve model root: %s", exc)
@@ -233,12 +241,10 @@ class QwenEditModel:
             detail = ""
             try:
                 from mflux.models.common.resolution.path_resolution import PathResolution
-                from mflux.models.qwen.weights.qwen_weight_definition import (
-                    QwenWeightDefinition,
-                )
 
                 root = PathResolution.resolve(
-                    path=repo_id, patterns=QwenWeightDefinition.get_download_patterns()
+                    path=repo_id,
+                    patterns=["*/*.safetensors", "*/*.json"],
                 )
                 if root is not None:
                     problems = verify_weights(Path(root))
@@ -291,6 +297,8 @@ class QwenEditModel:
         if model is None or self._encoder_evicted:
             return
 
+        # qwen_vl_encoder / the qwen_vl tokenizer only exist on Qwen-Image-Edit;
+        # every family has `text_encoder`.
         for attr in ("text_encoder", "qwen_vl_encoder"):
             if getattr(model, attr, None) is not None:
                 setattr(model, attr, None)
@@ -326,7 +334,19 @@ class QwenEditModel:
         logger.info("Text encoder reloaded in %.1fs", time.perf_counter() - started)
 
     def _reload_text_encoder(self) -> None:
-        """Load only the text_encoder component back onto the live model."""
+        """Load only the text_encoder component back onto the live model.
+
+        Implemented for Qwen-Image-Edit, whose 15.5 GB bf16 encoder makes a
+        partial reload worth the special-casing. Other families raise, and the
+        caller falls back to reconstructing the whole pipeline — cheap for them,
+        since their encoders are quantised and small.
+        """
+        if self.family.key != "qwen-image-edit":
+            raise ModelLoadError(
+                f"No partial text-encoder reload for {self.family.key}; "
+                "reloading the full pipeline instead."
+            )
+
         from mflux.models.common.weights.loading.weight_applier import WeightApplier
         from mflux.models.common.weights.loading.weight_loader import WeightLoader
         from mflux.models.qwen.model.qwen_text_encoder.qwen_text_encoder import (
@@ -557,6 +577,7 @@ def download_model(
     repo_id: str,
     cache_dir: Path,
     *,
+    family: str | ModelFamily = "flux2-klein-edit",
     max_attempts: int = 6,
     workers: int = 4,
     disable_xet: bool | None = None,
@@ -588,13 +609,13 @@ def download_model(
 
     try:
         from huggingface_hub import snapshot_download
-        from mflux.models.qwen.weights.qwen_weight_definition import QwenWeightDefinition
     except ImportError as exc:
         raise ModelLoadError(
             "Dependencies are not installed. Run: pip install -r requirements.txt"
         ) from exc
 
-    patterns = [*QwenWeightDefinition.get_download_patterns(), "tokenizer/*"]
+    resolved = family if isinstance(family, ModelFamily) else get_family(family)
+    patterns = [*resolved.load_weight_definition().get_download_patterns(), "tokenizer/*"]
     last_error: Exception | None = None
 
     for attempt in range(1, max_attempts + 1):
@@ -879,18 +900,20 @@ def verify_weights(root: Path) -> list[str]:
     return problems
 
 
-def is_model_cached(repo_id: str, cache_dir: Path) -> bool:
+def is_model_cached(
+    repo_id: str, cache_dir: Path, family: str | ModelFamily = "flux2-klein-edit"
+) -> bool:
     """True if the weights are already on disk, so the UI can warn about a download."""
     configure_hf_cache(cache_dir)
     if Path(repo_id).expanduser().is_dir():
         return True
     try:
         from mflux.models.common.resolution.path_resolution import PathResolution
-        from mflux.models.qwen.weights.qwen_weight_definition import QwenWeightDefinition
 
+        resolved = family if isinstance(family, ModelFamily) else get_family(family)
         return (
             PathResolution._find_complete_cached_snapshot(
-                repo_id, QwenWeightDefinition.get_download_patterns()
+                repo_id, resolved.load_weight_definition().get_download_patterns()
             )
             is not None
         )

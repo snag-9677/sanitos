@@ -353,10 +353,19 @@ def reset_peak_memory() -> None:
         pass
 
 
-def startup_banner(info: DeviceInfo, model_label: str, memory_mode: str) -> str:
-    """Render the startup information block."""
+def startup_banner(
+    info: DeviceInfo,
+    model_label: str,
+    memory_mode: str,
+    working_set_gb: float = 32.4,
+) -> str:
+    """Render the startup information block.
+
+    ``working_set_gb`` comes from the configured model family, so the memory
+    advice reflects the model actually being loaded.
+    """
     if info.backend == "mlx-cuda":
-        title = "Qwen Image Edit — MLX / CUDA"
+        title = "Local Image Edit — MLX / CUDA"
         gpu = info.gpu_name or "NVIDIA GPU"
         memory_line = (
             f"  Memory        {info.gpu_memory_gb:.0f} GB VRAM, "
@@ -365,7 +374,7 @@ def startup_banner(info: DeviceInfo, model_label: str, memory_mode: str) -> str:
             else f"  Memory        {info.total_memory_gb:.0f} GB system"
         )
     else:
-        title = "Qwen Image Edit — Apple Silicon"
+        title = "Local Image Edit — Apple Silicon"
         gpu = f"{info.gpu_cores}-core GPU" if info.gpu_cores else "GPU"
         memory_line = f"  Memory        {info.total_memory_gb:.0f} GB unified"
 
@@ -391,7 +400,7 @@ def startup_banner(info: DeviceInfo, model_label: str, memory_mode: str) -> str:
         f"  Model         {model_label}",
         f"  Memory mode   {memory_mode}",
         memory_line,
-        f"                {info.memory_advice()}",
+        f"                {info.memory_advice(working_set_gb)}",
         "",
         f"  {platform_line}   Python {info.python_version}   "
         f"MLX {info.mlx_version}{platform_suffix}",

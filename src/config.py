@@ -81,6 +81,8 @@ class StylePreset:
 class ModelConfig:
     repo_id: str
     cache_dir: Path
+    # Which mflux pipeline drives this repo; see src/families.py.
+    family: str = "flux2-klein-edit"
     quantize: int | None = None
     preload: bool = False
     lora_paths: list[str] = field(default_factory=list)
@@ -89,6 +91,12 @@ class ModelConfig:
     def __post_init__(self) -> None:
         if not self.repo_id:
             raise ConfigError("model.repo_id must not be empty.")
+        from .families import FAMILIES
+
+        if self.family not in FAMILIES:
+            raise ConfigError(
+                f"model.family must be one of {sorted(FAMILIES)}, got {self.family!r}."
+            )
         if len(self.lora_paths) != len(self.lora_scales):
             raise ConfigError(
                 f"model.lora_paths has {len(self.lora_paths)} entries but "
@@ -244,6 +252,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         model=ModelConfig(
             repo_id=str(model_raw.get("repo_id", "")).strip(),
             cache_dir=resolve_path(model_raw.get("cache_dir", "./models/hf"), root=root),
+            family=str(model_raw.get("family", "flux2-klein-edit")).strip(),
             quantize=model_raw.get("quantize"),
             preload=bool(model_raw.get("preload", False)),
             lora_paths=list(model_raw.get("lora_paths") or []),
