@@ -187,6 +187,8 @@ class EditModel:
             if self.vae_tiling:
                 self._enable_vae_tiling(model)
 
+            self._materialise_weights(model, progress)
+
             self._model = model
             self._encoder_evicted = False
             self._load_seconds = time.perf_counter() - started
@@ -219,10 +221,27 @@ class EditModel:
             return None
 
     def _apply_mlx_limits(self) -> None:
-        if self.memory_mode != "off" and self.cache_limit_bytes is not None:
+        # A small buffer cache is only worth it when memory is genuinely tight.
+        # MLX reuses freed buffers from this cache; capping it forces a real
+        # allocator round-trip every step. That is cheap on unified memory but
+        # expensive and fragmenting on a discrete GPU, where each reclaim is a
+        # cudaFreeAsync/cudaMallocAsync pair — a plausible route to both very
+        # slow steps and an out-of-memory abort.
+        if (
+            self.memory_mode == "low"
+            and self.cache_limit_bytes is not None
+            and not self.memory_budget_gb
+        ):
             from .device import apply_memory_settings
 
             apply_memory_settings(self.cache_limit_bytes)
+        elif self.cache_limit_bytes is not None:
+            logger.debug(
+                "Leaving MLX's buffer cache at its default (memory_mode=%s, "
+                "discrete GPU=%s).",
+                self.memory_mode,
+                bool(self.memory_budget_gb),
+            )
 
         # On a discrete GPU an over-allocation surfaces as an uncaught C++
         # abort from the CUDA allocator ("cudaMallocAsync ... out of memory"),
@@ -274,6 +293,45 @@ class EditModel:
             f"  - Reduce the resolution preset.\n"
             f"This check exists because exceeding GPU memory aborts the process "
             f"from inside the CUDA allocator rather than raising an error."
+        )
+
+    def _materialise_weights(self, model: Any, progress: ProgressFn | None = None) -> None:
+        """Force the weights onto the compute device once, up front.
+
+        mflux leaves weights as lazy graph nodes backed by the memory-mapped
+        safetensors — a load reports 0 GB resident. On unified memory that is
+        harmless: the first evaluation materialises them and the OS keeps the
+        pages. On a discrete GPU it is not, because host memory-mapped data has
+        to be copied into VRAM, and leaving that to happen implicitly inside
+        the denoise loop mixes a multi-GB transfer into the same allocation
+        window as the activations.
+
+        Evaluating the parameter tree once makes residency explicit and gives
+        an honest memory figure to report.
+        """
+        try:
+            import mlx.core as mx
+        except ImportError:
+            return
+
+        self._report(progress, "Loading onto the GPU", f"{self.family.working_set_gb:.0f} GB")
+        started = time.perf_counter()
+        try:
+            mx.eval(model.parameters())
+        except Exception as exc:  # noqa: BLE001 - fall back to lazy behaviour
+            logger.warning(
+                "Could not pre-load weights onto the device (%s); they will "
+                "materialise during the first denoise step instead.",
+                exc,
+            )
+            return
+
+        from .device import active_memory_gb
+
+        logger.info(
+            "Weights resident: %.1f GB in %.1fs",
+            active_memory_gb(),
+            time.perf_counter() - started,
         )
 
     def _enable_vae_tiling(self, model: Any) -> None:

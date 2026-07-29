@@ -235,3 +235,81 @@ def test_every_catalog_entry_resolves(tmp_path: Path) -> None:
         family = get_family(entry.family)
         assert family.load_pipeline_class()
         assert entry.size_gb > 0
+
+
+# ------------------------------------------------ cache-limit policy (CUDA)
+
+
+def test_cache_limit_is_not_applied_on_a_discrete_gpu(tmp_path: Path, monkeypatch) -> None:
+    """Capping MLX's buffer cache is counter-productive on CUDA.
+
+    Each reclaim becomes a cudaFreeAsync/cudaMallocAsync round-trip, which is
+    slow and fragmenting — a plausible route to both 100s+ steps and an OOM
+    abort. On unified memory the same cap is cheap.
+    """
+    import src.device as device_module
+
+    applied: list[int] = []
+    monkeypatch.setattr(device_module, "apply_memory_settings", lambda n: applied.append(n))
+
+    gpu = EditModel(
+        repo_id="mlx-community/flux2-klein-9b-8bit",
+        cache_dir=tmp_path,
+        family="flux2-klein-edit",
+        memory_mode="low",
+        cache_limit_bytes=1024**3,
+        memory_budget_gb=24.0,          # discrete GPU
+    )
+    gpu._apply_mlx_limits()
+    assert applied == [], "no buffer-cache cap should be set on a discrete GPU"
+
+
+def test_cache_limit_applies_in_low_mode_on_unified_memory(tmp_path: Path, monkeypatch) -> None:
+    import src.device as device_module
+
+    applied: list[int] = []
+    monkeypatch.setattr(device_module, "apply_memory_settings", lambda n: applied.append(n))
+
+    mac = EditModel(
+        repo_id="OsaurusAI/Qwen-Image-Edit-mflux-q6",
+        cache_dir=tmp_path,
+        family="qwen-image-edit",
+        memory_mode="low",
+        cache_limit_bytes=1024**3,
+        memory_budget_gb=None,          # unified memory
+    )
+    mac._apply_mlx_limits()
+    assert applied == [1024**3]
+
+
+def test_cache_limit_not_applied_when_the_model_fits(tmp_path: Path, monkeypatch) -> None:
+    """balanced mode means memory is not tight; let MLX pool buffers."""
+    import src.device as device_module
+
+    applied: list[int] = []
+    monkeypatch.setattr(device_module, "apply_memory_settings", lambda n: applied.append(n))
+
+    model = EditModel(
+        repo_id="mlx-community/flux2-klein-9b-8bit",
+        cache_dir=tmp_path,
+        family="flux2-klein-edit",
+        memory_mode="balanced",
+        cache_limit_bytes=1024**3,
+    )
+    model._apply_mlx_limits()
+    assert applied == []
+
+
+def test_materialise_survives_a_model_without_parameters(tmp_path: Path) -> None:
+    """Pre-loading is an optimisation; it must never break loading."""
+    model = EditModel(
+        repo_id="mlx-community/flux2-klein-9b-8bit",
+        cache_dir=tmp_path,
+        family="flux2-klein-edit",
+    )
+
+    class Broken:
+        def parameters(self):
+            raise RuntimeError("no parameters here")
+
+    model._materialise_weights(Broken())  # must not raise

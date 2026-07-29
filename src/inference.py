@@ -181,6 +181,19 @@ class _GenerationCallback:
         # Exclude preview decoding from the ETA, or the estimate jumps around.
         elapsed = time.perf_counter() - self.started - self.preview_seconds
 
+        # Memory per step is the signal that distinguishes "this model is big"
+        # from "something is re-allocating every step". Logged for the first
+        # few steps at INFO so it lands in the log without being asked for.
+        if self.completed_steps <= 3:
+            logger.info(
+                "step %d/%d — %.1fs, %.1f GB active, %.1f GB peak",
+                self.completed_steps,
+                self.total_steps,
+                elapsed,
+                active_memory_gb(),
+                peak_memory_gb(),
+            )
+
         preview = None
         if self.completed_steps in self._preview_steps:
             preview = self._decode_preview(latents, config)

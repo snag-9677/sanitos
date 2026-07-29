@@ -74,8 +74,13 @@ memory:
   #   off       No management at all.
   mode: "auto"
 
-  # Cap on MLX's buffer cache. MLX otherwise retains freed GPU buffers
-  # indefinitely across sequential denoise passes. Bytes; null disables.
+  # Cap on MLX's buffer cache, in bytes; null leaves MLX's default.
+  #
+  # Only applied in `low` mode on unified memory. MLX reuses freed buffers from
+  # this cache, so capping it forces a real allocator round-trip every step —
+  # cheap on Apple Silicon, but expensive and fragmenting on a discrete GPU
+  # where each reclaim is a cudaFreeAsync/cudaMallocAsync pair. It is therefore
+  # never applied on CUDA.
   cache_limit_bytes: 1073741824
 
   # Tile VAE encode/decode to cap activation memory at high resolutions.
