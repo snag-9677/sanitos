@@ -103,6 +103,29 @@ def test_auto_mode_evicts_when_the_model_does_not_fit() -> None:
     assert memory.resolve(working_set_gb=32.4, available_gb=24.0) == "low"
 
 
+def test_hard_limit_evicts_a_model_that_only_just_fits() -> None:
+    """The regression: FLUX.2 Klein 9B on a 24 GB card.
+
+    17.9 GB of weights clear 24 GB on paper, so unified memory keeps them
+    resident. On a discrete GPU the same choice left ~2 GB for activations
+    against an enforced 22.1 GB ceiling, and denoising aborted in
+    cudaMallocAsync — the encoder has to go.
+    """
+    memory = MemoryConfig(mode="auto")
+
+    assert memory.resolve(17.9, 24.0, hard_limit=False) == "balanced"
+    assert memory.resolve(17.9, 24.0, hard_limit=True) == "low"
+
+
+def test_hard_limit_still_keeps_a_genuinely_small_model_resident() -> None:
+    """Klein 4B (6.7 GB) has room to spare on the same card — no reload tax."""
+    assert MemoryConfig(mode="auto").resolve(6.7, 24.0, hard_limit=True) == "balanced"
+
+
+def test_hard_limit_keeps_a_big_card_comfortable() -> None:
+    assert MemoryConfig(mode="auto").resolve(32.4, 80.0, hard_limit=True) == "balanced"
+
+
 def test_explicit_mode_is_never_overridden() -> None:
     assert MemoryConfig(mode="balanced").resolve(32.4, 24.0) == "balanced"
     assert MemoryConfig(mode="low").resolve(6.6, 64.0) == "low"

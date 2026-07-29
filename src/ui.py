@@ -72,7 +72,7 @@ class EditorUI:
         self.config = config
         self.device = device
         self.model = model
-        self.editor = ImageEditor(model)
+        self.editor = ImageEditor(model, reference_scale=config.memory.reference_scale)
         # One cancel flag per running job; replaced at the start of each edit.
         self._cancel = threading.Event()
 
@@ -267,7 +267,9 @@ class EditorUI:
 
         family = get_family(entry.family)
         mode = self.config.memory.resolve(
-            family.working_set_gb, self.device.usable_memory_gb
+            family.working_set_gb,
+            self.device.usable_memory_gb,
+            hard_limit=self.device.has_hard_memory_limit,
         )
 
         try:
@@ -345,6 +347,44 @@ class EditorUI:
 
     # ------------------------------------------------------------ generation
 
+    @staticmethod
+    def _gallery_images(value: Any) -> list[Image.Image]:
+        """Normalise a gr.Gallery value into plain PIL images.
+
+        Gradio hands back ``(image, caption)`` pairs, and the image may be a PIL
+        object or a path depending on how it arrived (upload vs. programmatic
+        set), so both are unwrapped here.
+        """
+        if not value:
+            return []
+
+        images: list[Image.Image] = []
+        for item in value:
+            entry = item[0] if isinstance(item, (tuple, list)) and item else item
+            if entry is None:
+                continue
+            if isinstance(entry, Image.Image):
+                images.append(entry)
+                continue
+            try:
+                images.append(load_image(Image.open(entry)))
+            except Exception as exc:  # noqa: BLE001 - skip what we can't read
+                logger.warning("Ignoring unreadable reference image %r: %s", entry, exc)
+        return images
+
+    def on_references_change(self, value: Any) -> Any:
+        """Retitle the reference panel with the count and any over-limit warning."""
+        count = len(self._gallery_images(value))
+        limit = self.model.family.max_reference_images
+        label = f"Reference images ({count}/{limit})"
+        if count > limit:
+            label = f"⚠️ Reference images ({count}/{limit}) — too many for {self.model.label}"
+            gr.Warning(
+                f"{self.model.label} takes at most {limit} reference images. "
+                f"Remove {count - limit} before editing."
+            )
+        return gr.update(label=label)
+
     def on_submit(
         self,
         instruction: str,
@@ -358,6 +398,8 @@ class EditorUI:
         height: int | None,
         negative_prompt: str,
         resolution_label: str = "",
+        reference_images: Any = None,
+        use_reference_images: bool = True,
     ) -> Iterator[tuple[Any, ...]]:
         """Run one edit, streaming progress into the thread.
 
@@ -391,7 +433,12 @@ class EditorUI:
 
         try:
             request = EditRequest(
-                images=[parent_image],
+                image=parent_image,
+                references=(
+                    self._gallery_images(reference_images)
+                    if use_reference_images
+                    else []
+                ),
                 instruction=instruction.strip(),
                 seed=seed,
                 steps=int(steps),
@@ -584,6 +631,37 @@ class EditorUI:
                         sources=["upload", "clipboard"],
                     )
 
+                    with gr.Accordion(
+                        f"Reference images (0/{family.max_reference_images})",
+                        open=False,
+                    ) as references_panel:
+                        use_references = gr.Checkbox(
+                            value=True,
+                            label="Use reference images",
+                            info="Off keeps them attached but ignores them — "
+                                 "the quickest way to see what they are "
+                                 "actually contributing.",
+                        )
+                        references = gr.Gallery(
+                            label=None,
+                            type="pil",
+                            height=170,
+                            columns=4,
+                            interactive=True,
+                            show_label=False,
+                        )
+                        gr.Markdown(
+                            "<span class='qe-hint'>Extra views of the same "
+                            "subject — other angles, a clearer shot of a face — "
+                            "for the model to draw on. They condition the edit; "
+                            "they are never edited themselves.<br>Cost is in "
+                            "tokens, not pixels: every image is re-encoded at "
+                            "the output resolution, so three references at "
+                            "512&nbsp;px are cheaper than one at 768&nbsp;px. "
+                            "With <code>reference_scale: auto</code> they are "
+                            "shrunk just enough to fit.</span>"
+                        )
+
                     model_choices = [
                         e.describe(self.device.usable_memory_gb)
                         for e in cfg.model.catalog
@@ -734,6 +812,7 @@ class EditorUI:
             submit_inputs = [
                 prompt, session_state, compare_mode, steps, guidance,
                 seed_box, randomise, width, height, negative, resolution,
+                references, use_references,
             ]
             submit_outputs = [
                 thread, id_map_state, comparison, branches, status,
@@ -758,6 +837,15 @@ class EditorUI:
                 concurrency_limit=1,
             )
             stop.click(self.on_stop, outputs=status)
+
+            # Keep the count in the collapsed header honest, and say so when
+            # there are more references than the current model will take —
+            # otherwise the only feedback is a failure at generation time.
+            references.change(
+                self.on_references_change,
+                inputs=references,
+                outputs=references_panel,
+            )
 
             revert_btn.click(
                 self.on_revert,

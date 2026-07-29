@@ -27,6 +27,21 @@ logger = logging.getLogger(__name__)
 
 Backend = Literal["mlx-metal", "mlx-cuda", "cpu"]
 
+# Fraction of a discrete GPU's VRAM MLX is allowed to allocate. The remainder
+# covers the driver's own context, whatever else is on the display, and
+# allocator fragmentation. Exceeding the card aborts the process from inside
+# the CUDA allocator, so this is deliberately conservative.
+GPU_MEMORY_SAFETY_FACTOR = 0.92
+
+# Room to leave beyond the weights on a device with a hard ceiling: activations,
+# latents, and the preview and final VAE decodes.
+#
+# Measured on an RTX A5000 (24 GB) with FLUX.2 Klein 9B: 17.9 GB of weights
+# peaked at 20.1 GB by the first denoise step at the 0.6 MP preset, and the
+# 1.0 MP preset decodes larger tiles on top of that. 2 GB — enough on unified
+# memory, where an overshoot merely pages — is not enough here.
+HARD_LIMIT_HEADROOM_GB = 6.0
+
 
 @dataclass(slots=True)
 class DeviceInfo:
@@ -60,6 +75,23 @@ class DeviceInfo:
         return self.backend == "mlx-metal"
 
     @property
+    def has_hard_memory_limit(self) -> bool:
+        """True when overshooting aborts rather than swaps.
+
+        A discrete GPU has nothing behind its VRAM: an over-allocation is fatal,
+        not slow. That changes both how much headroom the memory policy has to
+        reserve and whether the model is worth refusing up front.
+        """
+        return self.backend == "mlx-cuda" and bool(self.gpu_memory_gb)
+
+    @property
+    def device_memory_ceiling_gb(self) -> float:
+        """The most the app may actually allocate, after the safety margin."""
+        if self.has_hard_memory_limit:
+            return self.usable_memory_gb * GPU_MEMORY_SAFETY_FACTOR
+        return self.usable_memory_gb
+
+    @property
     def usable_memory_gb(self) -> float:
         """Memory the model actually has to fit into."""
         if self.backend == "mlx-cuda" and self.gpu_memory_gb:
@@ -74,18 +106,25 @@ class DeviceInfo:
             "cpu": "CPU",
         }[self.backend]
 
-    def memory_advice(self, working_set_gb: float = 32.4) -> str:
+    def memory_advice(
+        self, working_set_gb: float = 32.4, denoise_peak_gb: float = 16.9
+    ) -> str:
         """Human-readable guidance on whether this machine fits the model."""
         available = self.usable_memory_gb
         kind = "RAM" if self.is_unified_memory else "VRAM"
 
         if available <= 0:
             return "Could not determine available memory."
-        if available >= working_set_gb + 4:
+
+        # Keeping everything resident needs room for the activations on top.
+        # On a hard ceiling that margin is the difference between running and
+        # aborting, so it is held to the same bar the memory policy uses.
+        headroom = HARD_LIMIT_HEADROOM_GB if self.has_hard_memory_limit else 4.0
+        if self.device_memory_ceiling_gb >= working_set_gb + headroom:
             return f"Comfortable — full model fits in {kind} with headroom."
 
         # Low mode keeps only the transformer resident during denoising.
-        denoise_peak = 16.9
+        denoise_peak = denoise_peak_gb
         if available >= denoise_peak + 2:
             return (
                 f"Tight — {working_set_gb:.0f} GB working set on "
@@ -358,11 +397,12 @@ def startup_banner(
     model_label: str,
     memory_mode: str,
     working_set_gb: float = 32.4,
+    denoise_peak_gb: float = 16.9,
 ) -> str:
     """Render the startup information block.
 
-    ``working_set_gb`` comes from the configured model family, so the memory
-    advice reflects the model actually being loaded.
+    The footprints come from the configured model family, so the memory advice
+    reflects the model actually being loaded.
     """
     if info.backend == "mlx-cuda":
         title = "Local Image Edit — MLX / CUDA"
@@ -400,7 +440,7 @@ def startup_banner(
         f"  Model         {model_label}",
         f"  Memory mode   {memory_mode}",
         memory_line,
-        f"                {info.memory_advice(working_set_gb)}",
+        f"                {info.memory_advice(working_set_gb, denoise_peak_gb)}",
         "",
         f"  {platform_line}   Python {info.python_version}   "
         f"MLX {info.mlx_version}{platform_suffix}",

@@ -151,9 +151,9 @@ if (( DO_DEPS )); then
   fi
 
   if command -v shasum >/dev/null 2>&1; then
-    REQ_HASH="$(shasum -a 256 requirements.txt | cut -d' ' -f1)"
+    REQ_HASH="$(cat requirements.txt requirements-cuda.txt | shasum -a 256 | cut -d' ' -f1)"
   else
-    REQ_HASH="$(sha256sum requirements.txt | cut -d' ' -f1)"
+    REQ_HASH="$(cat requirements.txt requirements-cuda.txt | sha256sum | cut -d' ' -f1)"
   fi
   if [[ "$(cat "$STAMP" 2>/dev/null)" == "$REQ_HASH" ]]; then
     ok "Dependencies already up to date"
@@ -173,6 +173,21 @@ if (( DO_DEPS )); then
       sleep $((attempt * 5))
     done
     (( installed )) || fail "Dependency installation failed after 3 attempts."
+
+    # Linux/NVIDIA needs mlx newer than mflux's pin allows. It has to be a
+    # second install: pip solves one requirements file as a single problem, so
+    # merging this in fails with ResolutionImpossible rather than warning.
+    if [[ "$OS" == "Linux" ]]; then
+      info "Applying the Linux/CUDA mlx override (a dependency-conflict warning here is expected)…"
+      if command -v uv >/dev/null 2>&1; then
+        VIRTUAL_ENV="$VENV_DIR" uv pip install -q -r requirements-cuda.txt \
+          || fail "Could not install requirements-cuda.txt"
+      else
+        "$PYTHON_BIN" -m pip install -q -r requirements-cuda.txt \
+          || fail "Could not install requirements-cuda.txt"
+      fi
+      ok "CUDA override applied"
+    fi
     printf '%s' "$REQ_HASH" > "$STAMP"
     ok "Dependencies installed"
   fi

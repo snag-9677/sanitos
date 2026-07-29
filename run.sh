@@ -64,22 +64,39 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
 fi
 
 # --- dependencies ---------------------------------------------------------
+# On Linux the CUDA override is a separate, second install. It overrides an
+# mflux pin, and pip solves one requirements file as a single problem, so
+# merging the two files fails with ResolutionImpossible instead of warning.
+install_cuda_override() {
+  [[ "$(uname -s)" == "Linux" ]] || return 0
+  if command -v uv >/dev/null 2>&1; then
+    VIRTUAL_ENV="$VENV_DIR" uv pip install --quiet -r requirements-cuda.txt && return 0
+  fi
+  "$PYTHON_BIN" -m pip install --quiet -r requirements-cuda.txt
+}
+
 install_requirements() {
   # uv is dramatically faster and is also what creates pip-less venvs, so try
   # it first and fall back to pip (bootstrapping pip if the venv lacks it).
   if command -v uv >/dev/null 2>&1; then
-    VIRTUAL_ENV="$VENV_DIR" uv pip install --quiet -r requirements.txt && return 0
+    VIRTUAL_ENV="$VENV_DIR" uv pip install --quiet -r requirements.txt && \
+      install_cuda_override && return 0
   fi
   if ! "$PYTHON_BIN" -m pip --version >/dev/null 2>&1; then
     info "Bootstrapping pip …"
     "$PYTHON_BIN" -m ensurepip --upgrade >/dev/null 2>&1 || return 1
   fi
   "$PYTHON_BIN" -m pip install --quiet --upgrade pip
-  "$PYTHON_BIN" -m pip install --quiet -r requirements.txt
+  "$PYTHON_BIN" -m pip install --quiet -r requirements.txt && install_cuda_override
 }
 
-# Reinstall only when requirements.txt changes.
-REQ_HASH="$(shasum -a 256 requirements.txt | cut -d' ' -f1)"
+# Reinstall when either requirements file changes. shasum is the macOS spelling
+# and sha256sum the Linux one; neither is reliably present on the other.
+if command -v shasum >/dev/null 2>&1; then
+  REQ_HASH="$(cat requirements.txt requirements-cuda.txt | shasum -a 256 | cut -d' ' -f1)"
+else
+  REQ_HASH="$(cat requirements.txt requirements-cuda.txt | sha256sum | cut -d' ' -f1)"
+fi
 if [[ ! -f "$STAMP" ]] || [[ "$(cat "$STAMP" 2>/dev/null)" != "$REQ_HASH" ]]; then
   info "Installing dependencies (first run downloads a few hundred MB) …"
   install_requirements || fail "Dependency installation failed."

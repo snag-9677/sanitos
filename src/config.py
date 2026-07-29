@@ -17,6 +17,8 @@ from typing import Any
 
 import yaml
 
+from .device import GPU_MEMORY_SAFETY_FACTOR, HARD_LIMIT_HEADROOM_GB
+
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -194,26 +196,57 @@ class MemoryConfig:
     mode: str = "auto"
     cache_limit_bytes: int | None = 1024**3
     vae_tiling: bool = True
+    # Fraction of the output resolution at which reference images are encoded.
+    # "auto" shrinks them just enough to fit. See src/references.py.
+    reference_scale: float | str = "auto"
 
     VALID_MODES = ("auto", "balanced", "low", "off")
 
-    def resolve(self, working_set_gb: float, available_gb: float) -> str:
+    def resolve(
+        self, working_set_gb: float, available_gb: float, *, hard_limit: bool = False
+    ) -> str:
         """Turn ``auto`` into a concrete mode for the selected model.
 
         Eviction costs a text-encoder reload every turn, so it is only worth
         paying when the model genuinely does not fit. Models are switchable at
         runtime now, so this is decided per model rather than once in the file.
+
+        ``hard_limit`` marks a device with no swap behind it — a discrete GPU.
+        "Fits" is a stricter question there: the weights must leave room for the
+        activations too, because overshooting aborts the process instead of
+        paging. FLUX.2 Klein 9B is exactly the case that separates the two —
+        17.9 GB of weights clear a 24 GB bar on paper, but its denoise steps
+        peaked at 20.1 GB with the text encoder still resident, against an
+        enforced ceiling of 22.1 GB.
         """
         if self.mode != "auto":
             return self.mode
         if available_gb <= 0:
             return "balanced"
-        return "balanced" if working_set_gb <= available_gb - 2 else "low"
+
+        if hard_limit:
+            ceiling = available_gb * GPU_MEMORY_SAFETY_FACTOR
+            headroom = HARD_LIMIT_HEADROOM_GB
+        else:
+            ceiling, headroom = available_gb, 2.0
+
+        return "balanced" if working_set_gb <= ceiling - headroom else "low"
 
     def __post_init__(self) -> None:
         if self.mode not in self.VALID_MODES:
             raise ConfigError(
                 f"memory.mode must be one of {self.VALID_MODES}, got {self.mode!r}."
+            )
+        if isinstance(self.reference_scale, str):
+            if self.reference_scale != "auto":
+                raise ConfigError(
+                    "memory.reference_scale must be a number between 0.1 and 1.0, "
+                    f"or 'auto', got {self.reference_scale!r}."
+                )
+        elif not 0.1 <= float(self.reference_scale) <= 1.0:
+            raise ConfigError(
+                "memory.reference_scale must be between 0.1 and 1.0, "
+                f"got {self.reference_scale!r}."
             )
 
 

@@ -86,6 +86,24 @@ memory:
   # Tile VAE encode/decode to cap activation memory at high resolutions.
   vae_tiling: true
 
+  # Size at which reference images are encoded, as a fraction of the output
+  # resolution. The image being edited always stays at full size.
+  #
+  # Reference cost is measured in tokens, not pixels: mflux re-encodes every
+  # image at the output resolution, so shrinking the files themselves saves
+  # nothing. Encoding a reference at half scale, however, costs a quarter of
+  # the tokens — which is the only lever that actually moves memory.
+  #
+  #   auto    Shrink references just enough to fit the free VRAM (never below
+  #           25%, where a reference stops carrying usable identity). On
+  #           unified memory this stays at 1.0, since overshooting there is
+  #           slow rather than fatal.
+  #   1.0     Full detail. Best quality, and what will run out of memory first.
+  #   0.5     Quarter of the tokens per reference.
+  #
+  # FLUX.2 only; Qwen conditions images through a different path.
+  reference_scale: "auto"
+
 generation:
   # Defaults for the UI. Everything here is overridable per-edit.
   # FLUX.2 wants guidance near 1.0 — unlike Qwen, which likes ~4.0. It also

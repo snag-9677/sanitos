@@ -107,6 +107,12 @@ def main() -> int:
             return 2
 
     configure_logging(config.logging)
+
+    # Before anything imports an mflux pipeline. See src/compat.py.
+    from src.compat import apply_compatibility_patches
+
+    apply_compatibility_patches()
+
     device = detect_device()
 
     if args.list_models:
@@ -136,11 +142,23 @@ def main() -> int:
     entry = config.model.active_entry
     family = get_family(entry.family)
     # `auto` picks per model, so it must be resolved after the model is known.
-    memory_mode = config.memory.resolve(family.working_set_gb, device.usable_memory_gb)
+    memory_mode = config.memory.resolve(
+        family.working_set_gb,
+        device.usable_memory_gb,
+        hard_limit=device.has_hard_memory_limit,
+    )
     # Only bound memory where there is no swap to fall back on.
-    memory_budget = device.gpu_memory_gb if device.backend == "mlx-cuda" else None
+    memory_budget = device.gpu_memory_gb if device.has_hard_memory_limit else None
 
-    print(startup_banner(device, family.label, memory_mode, family.working_set_gb))
+    print(
+        startup_banner(
+            device,
+            family.label,
+            memory_mode,
+            family.working_set_gb,
+            family.denoise_peak_gb,
+        )
+    )
 
     cached = is_model_cached(entry.repo_id, config.model.cache_dir, family)
     size_note = f"not downloaded yet (~{family.working_set_gb:.0f} GB on first edit)"

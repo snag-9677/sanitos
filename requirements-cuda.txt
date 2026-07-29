@@ -1,0 +1,28 @@
+# Linux / NVIDIA only. Apply AFTER requirements.txt:
+#
+#     pip install -r requirements.txt
+#     pip install -r requirements-cuda.txt
+#
+# pip will print a dependency-conflict warning about mflux's mlx ceiling. That
+# is expected here — a warning about an already-installed package, not the
+# hard ResolutionImpossible you get if this line is merged into
+# requirements.txt and pip has to solve both at once.
+#
+# Why the override: every mlx before 0.32.0 crashes decoding the VAE on the
+# CUDA backend. Kernels for large non-contiguous inputs map the collapsed outer
+# dimensions straight onto CUDA's gridDim.y, which every architecture caps at
+# 65,535. The final 256-channel upsample in the FLUX.2 VAE (256x256 -> 512x512)
+# goes past it, so the launch is rejected — "cudaLaunchKernelExC ... invalid
+# argument", or "cudaGraphAddKernelNode ... invalid argument" with CUDA graphs
+# on, where MLX aborts the process rather than raising. It reproduces with no
+# model loaded at all:
+#
+#     h = mx.random.normal((1, 256, 512, 256)).astype(mx.bfloat16)
+#     mx.eval(mx.repeat(h, 2, axis=3))
+#
+# ml-explore/mlx#3666 tiles the overflow into gridDim.z and ships in 0.32.0.
+# mflux 0.18.0 pins mlx[cuda13]<0.32.0, a ceiling that predates the fix rather
+# than describing a real incompatibility: the suite passes on 0.32.0 and it is
+# also markedly faster, since much of CUDA quantised matmul landed in
+# 0.31.2-0.32.0 (measured on an RTX A5000: 107s -> 8.3s per denoise step).
+mlx[cuda13]>=0.32.0; sys_platform == "linux"

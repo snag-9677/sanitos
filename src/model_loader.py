@@ -136,6 +136,25 @@ class EditModel:
         return self._load_seconds
 
     @property
+    def conditioning_headroom_gb(self) -> float:
+        """Memory left for conditioning tokens once the weights are resident.
+
+        0.0 on unified memory, where there is no hard ceiling to fit under and
+        an overshoot costs speed rather than the process.
+        """
+        if not self.memory_budget_gb:
+            return 0.0
+
+        from .device import GPU_MEMORY_SAFETY_FACTOR
+
+        resident = (
+            self.family.denoise_peak_gb
+            if self.memory_mode == "low"
+            else self.family.working_set_gb
+        )
+        return max(0.0, self.memory_budget_gb * GPU_MEMORY_SAFETY_FACTOR - resident)
+
+    @property
     def label(self) -> str:
         return self._label or self.family.label
 
@@ -154,6 +173,12 @@ class EditModel:
 
             self._report(progress, "Locating model", self.repo_id)
             started = time.perf_counter()
+
+            # Must precede the pipeline import: some mflux modules bind the
+            # functions this patches at import time. See src/compat.py.
+            from .compat import apply_compatibility_patches
+
+            apply_compatibility_patches()
 
             try:
                 pipeline_class = self.family.load_pipeline_class()
@@ -251,7 +276,9 @@ class EditModel:
             try:
                 import mlx.core as mx
 
-                limit = int(self.memory_budget_gb * 0.92 * 1024**3)
+                from .device import GPU_MEMORY_SAFETY_FACTOR
+
+                limit = int(self.memory_budget_gb * GPU_MEMORY_SAFETY_FACTOR * 1024**3)
                 mx.set_memory_limit(limit)
                 logger.debug("MLX memory limit set to %.1f GB", limit / 1024**3)
             except Exception as exc:  # noqa: BLE001

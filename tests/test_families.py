@@ -130,3 +130,39 @@ def test_every_family_has_sane_defaults(key: str) -> None:
     assert low <= family.default_guidance <= high
     assert family.default_steps >= 1
     assert family.decode_kind in {"qwen", "flux2"}
+
+
+# ----------------------------------------------------------- reference images
+
+
+def test_flux2_puts_the_edited_image_first() -> None:
+    """FLUX.2 reads image_paths[0] as the image being edited."""
+    family = get_family("flux2-klein-edit")
+    assert family.arrange_images("source", ["ref-a", "ref-b"]) == [
+        "source", "ref-a", "ref-b",
+    ]
+
+
+def test_qwen_puts_the_edited_image_last() -> None:
+    """Qwen sizes the output from image_paths[-1].
+
+    Appending references the way FLUX.2 wants would make Qwen edit the last
+    reference instead of the source — a wrong result, not a crash, which is
+    exactly the kind of bug that survives review.
+    """
+    family = get_family("qwen-image-edit")
+    assert family.arrange_images("source", ["ref-a", "ref-b"]) == [
+        "ref-a", "ref-b", "source",
+    ]
+
+
+def test_the_edited_image_survives_having_no_references() -> None:
+    for key in FAMILIES:
+        assert get_family(key).arrange_images("source", []) == ["source"]
+
+
+def test_every_family_declares_a_reference_budget() -> None:
+    """A family with no budget silently accepts references it cannot afford."""
+    for key, family in FAMILIES.items():
+        assert family.supports_references, f"{key} declares no reference capacity"
+        assert family.primary_image_position in {"first", "last"}

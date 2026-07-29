@@ -96,6 +96,34 @@ def test_big_card_is_comfortable() -> None:
     assert "VRAM" in info.memory_advice()
 
 
+def test_a_model_that_only_just_fits_a_card_is_not_called_comfortable() -> None:
+    """FLUX.2 Klein 9B on a 24 GB card: 17.9 GB of weights, no room to denoise.
+
+    Unified memory can call this comfortable — it pages if wrong. VRAM cannot.
+    """
+    card = make(backend="mlx-cuda", os_name="Linux", gpu_memory_gb=24.0)
+    mac = make(total_memory_gb=24.0)
+
+    advice = card.memory_advice(working_set_gb=17.9, denoise_peak_gb=9.8)
+    assert "Comfortable" not in advice
+    assert "low" in advice
+    assert "Comfortable" in mac.memory_advice(working_set_gb=17.9, denoise_peak_gb=9.8)
+
+
+def test_the_advised_denoise_peak_comes_from_the_model() -> None:
+    """A stale hardcoded peak told 24 GB users the wrong number to expect."""
+    card = make(backend="mlx-cuda", os_name="Linux", gpu_memory_gb=24.0)
+    assert "~10 GB peak" in card.memory_advice(working_set_gb=17.9, denoise_peak_gb=9.8)
+
+
+def test_only_a_discrete_gpu_has_a_hard_limit() -> None:
+    assert make(backend="mlx-cuda", os_name="Linux", gpu_memory_gb=24.0).has_hard_memory_limit
+    assert not make().has_hard_memory_limit
+    assert not make(backend="cpu", metal_available=False).has_hard_memory_limit
+    # A CUDA backend whose VRAM could not be read has no number to bound with.
+    assert not make(backend="mlx-cuda", os_name="Linux", gpu_memory_gb=None).has_hard_memory_limit
+
+
 def test_cuda_banner_has_no_macos_leakage() -> None:
     info = make(
         chip="AMD EPYC 7763",

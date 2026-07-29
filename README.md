@@ -62,6 +62,56 @@ Turn this photo into a cinematic still with dramatic lighting
 Qwen-Image-Edit responds well to explicit preservation clauses — adding
 "Keep everything else unchanged" measurably reduces unwanted drift.
 
+### Reference images
+
+Under **Reference images** you can attach extra views of the same subject —
+other angles, a clearer shot of a face — for the model to draw on. The source
+image is the one being edited; references only condition the result and are
+never themselves edited. This is what makes "build a better shot of this person
+from these angles" work.
+
+Each reference is VAE-encoded at the **output** resolution, patchified, and its
+tokens joined onto the attention stream with a temporal coordinate of their
+own, so the model can tell them apart. Every one of the 32 layers then
+processes that whole stream on every denoise step, and peak memory is linear in
+its length:
+
+```
+S = 512 (text, always padded)
+  + (width/16) x (height/16)          the latents being denoised
+  + (width/16) x (height/16)          the source image, as conditioning
+  + one such block per reference      shrunk by reference_scale
+```
+
+Two consequences that are easy to get backwards. The image being edited is
+counted **twice** — once as latents, once as conditioning — so it dominates,
+and lowering the output resolution shrinks two blocks at once while removing a
+reference shrinks one. And a reference is only as expensive as the resolution
+it is encoded at, which is why shrinking references works where compressing
+the files does nothing (mflux rescales them to the output size regardless).
+
+Measured on a 24 GB RTX A5000 with FLUX.2 Klein 9B, each run in a separate
+process:
+
+| Output | References | S | Result |
+|---|---|---|---|
+| 512 x 512 | 3 | 5632 | runs |
+| 704 x 704 | 2 at 50% | 5352 | runs |
+| 896 x 672 | 2 at 50% | 6336 | out of memory |
+| 768 x 768 | 1 | 7424 | out of memory |
+
+`memory.reference_scale: auto` prices this before each edit, shrinks references to
+the largest scale that fits, and refuses with a suggested resolution when none
+does. That matters because going over is not always a catchable error — CUDA
+graph instantiation aborts the process outright.
+
+The per-model cap (`max_reference_images`) is 4, matching Black Forest Labs'
+own API limit for Klein; it is a capability ceiling, not a memory guard.
+
+Which end of the list the edited image belongs on differs by model: FLUX.2
+reads the first image, Qwen the last. `ModelFamily.arrange_images` handles it,
+so the two never have to be thought about at the call site.
+
 ---
 
 ## Requirements
@@ -81,26 +131,42 @@ CPU-only inference takes well over an hour per image.
 
 Linux works too, with caveats. MLX publishes Linux wheels
 (`manylinux_2_35_x86_64` and `aarch64`) and mflux declares `mlx[cuda13]` on
-Linux, so the same 6-bit weights run on an **NVIDIA GPU via CUDA 13**. `setup.sh`
-and `run.sh` detect this and install the right wheel automatically —
-`requirements.txt` needs no changes, because mflux's own dependency markers
-select the CUDA build.
+Linux, so the same weights run on an **NVIDIA GPU via CUDA 13**. `setup.sh`
+and `run.sh` detect this and install the right wheel automatically.
 
 | | |
 |---|---|
-| GPU | NVIDIA, CUDA 13. **≥24 GB VRAM** for 768 px; ≥40 GB to run without `memory.mode: low` |
+| GPU | NVIDIA, CUDA 13. **≥24 GB VRAM** for FLUX.2 Klein 9B; ≥40 GB for Qwen |
 | Driver | Recent enough for CUDA 13 |
+| mlx | **≥0.32.0** — earlier versions crash decoding the VAE, see below |
 | Python | 3.11+ |
 
-Two honest caveats:
+Verified on an RTX A5000 (24 GB, sm_86) with FLUX.2 Klein 9B at 8-bit:
+9.8 GB resident while denoising, 20.3 GB peak, ~8 s per step at 896x672 once
+the CUDA kernels have JIT-compiled (the first step after a cold start pays a
+one-off ~80 s for that).
 
-* **Untested by the author.** Everything here was verified on an M5. The Linux
-  path follows from MLX's published platform support and is exercised by unit
-  tests, but no image has been generated on it.
-* **VRAM, not unified memory.** On Apple Silicon the 32 GB working set spills
-  into system RAM and merely gets slow. On a discrete GPU it OOMs instead.
-  `memory.mode: low` matters more here, not less — it bounds the denoise phase
-  to ~16.9 GB, which is what makes a 24 GB card viable at all.
+Three things behave differently here than on Apple Silicon:
+
+* **mlx must be ≥0.32.0, which is outside the range mflux declares.** mflux
+  0.18.0 pins `mlx[cuda13]<0.32.0`, but every earlier version aborts the whole
+  process when the VAE decodes: kernels for large non-contiguous inputs map the
+  collapsed outer dimensions straight onto CUDA's `gridDim.y`, capped at 65,535
+  on every architecture, and the FLUX.2 VAE's final 256-channel upsample
+  exceeds it ([ml-explore/mlx#3666](https://github.com/ml-explore/mlx/pull/3666),
+  fixed in 0.32.0). `requirements-cuda.txt` installs 0.32.0 explicitly, as a
+  separate second command; pip prints a dependency-conflict warning about
+  mflux's ceiling, which is expected. That ceiling predates the fix rather than
+  describing a real incompatibility.
+* **VRAM, not unified memory.** On Apple Silicon an oversized working set
+  spills into system RAM and merely gets slow. On a discrete GPU it aborts
+  inside the CUDA allocator instead. `memory.mode: low` therefore matters more
+  here, not less, and `auto` selects it far more readily — see
+  `MemoryConfig.resolve`. Keeping the 8 GB text encoder resident alongside the
+  9.6 GB transformer leaves too little room for activations on a 24 GB card,
+  even though the 17.9 GB working set "fits" on paper.
+* **Quantised matmul is younger on CUDA than on Metal.** Much of it landed in
+  mlx 0.31.2–0.32.0, which is another reason not to run older wheels here.
 
 AMD/ROCm and Apple Intel have no MLX GPU backend, so both fall back to CPU.
 
@@ -140,7 +206,17 @@ Install dependencies:
 
 ```bash
 pip install -r requirements.txt
+
+# Linux / NVIDIA only — required, and must be a second command.
+pip install -r requirements-cuda.txt
 ```
+
+On Linux the second line is not optional: `requirements.txt` alone resolves to
+the mlx version mflux pins, which aborts the process when the VAE decodes.
+It has to be separate because pip solves one requirements file as a single
+problem, so merging the two fails outright instead of warning. Expect a
+dependency-conflict warning from the second command — see
+`requirements-cuda.txt`.
 
 Run:
 
@@ -150,8 +226,9 @@ python app.py
 
 The UI opens at <http://127.0.0.1:7860>.
 
-`./run.sh` creates the virtualenv, installs dependencies only when
-`requirements.txt` changes, and forwards any flags to `app.py`.
+`./run.sh` creates the virtualenv, installs dependencies only when the
+requirements files change (applying the CUDA override automatically on Linux),
+and forwards any flags to `app.py`.
 
 ### Setting up on a slow or restricted network
 
@@ -339,8 +416,14 @@ terminate called after throwing an instance of 'std::runtime_error'
 ```
 
 That is a C++ abort, not a Python exception, so no handler can catch it. The
-app therefore does two things on a discrete GPU:
+app therefore does three things on a discrete GPU:
 
+* **A stricter `auto`.** `memory.mode: auto` demands the working set fit under
+  the enforced ceiling with 6 GB to spare, rather than the 2 GB it asks for on
+  unified memory, and drops to `low` otherwise. FLUX.2 Klein 9B is exactly the
+  case this exists for: 17.9 GB of weights clear 24 GB on paper, but keeping
+  the text encoder resident left denoising peaking at 20.1 GB against a
+  22.1 GB ceiling. Evicting it puts the steady state at 9.8 GB instead.
 * **Preflight.** Before loading, it compares the model's working set (or its
   denoise peak in `low` mode) plus ~2 GB of activation headroom against
   available VRAM, and refuses with an explanation naming smaller models.
@@ -483,7 +566,16 @@ curl -X POST http://127.0.0.1:7860/api/edit \
   -F steps=25 -F guidance=4.0 \
   -o edited.png
 
-# Or JSON in / JSON out (base64)
+# With reference images — repeat -F reference for each extra view.
+# `image` is edited; the references only condition the result.
+curl -X POST http://127.0.0.1:7860/api/edit \
+  -F image=@front.jpg \
+  -F reference=@left.jpg -F reference=@right.jpg \
+  -F 'instruction=a sharp studio portrait of this person' \
+  -F width=512 -F height=512 \
+  -o portrait.png
+
+# Or JSON in / JSON out (base64); references is a list of base64 strings
 curl -X POST http://127.0.0.1:7860/api/edit \
   -H 'Content-Type: application/json' \
   -d '{"image":"<base64>","instruction":"make it night time","steps":25}'
@@ -518,6 +610,7 @@ qwen-image-edit-m5/
 ├── app.py              entrypoint, CLI flags, startup banner
 ├── config.yaml         all settings
 ├── requirements.txt
+├── requirements-cuda.txt   Linux/NVIDIA mlx override, installed second
 ├── setup.sh            one-command install (deps + weights)
 ├── run.sh              venv bootstrap + launch
 ├── watch-download.py   live model-download monitor

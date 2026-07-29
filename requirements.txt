@@ -1,6 +1,5 @@
-# Qwen Image Edit — Apple Silicon (M5)
+# Qwen Image Edit — Apple Silicon (M5), with a supported Linux/CUDA path.
 #
-# macOS on Apple Silicon only. Nothing here is CUDA- or NVIDIA-specific.
 # Python 3.11+ required; 3.12 is what this was developed and tested against.
 
 # MLX implementation of Qwen-Image-Edit. Pulls in mlx, transformers, tokenizers,
@@ -9,17 +8,43 @@
 # supports 6-bit weights on Apple Silicon today.
 mflux==0.18.0
 
+# On Linux/NVIDIA there is a second, mandatory step:
+#
+#     pip install -r requirements-cuda.txt
+#
+# It cannot live in this file. It overrides an mflux pin, and pip resolves a
+# single requirements file as one problem — declaring both here fails outright
+# with ResolutionImpossible rather than warning. setup.sh and run.sh apply it
+# automatically. See requirements-cuda.txt for why the override is needed.
+
 # Web UI. Gradio 6 is required: the app uses gr.ImageSlider and the Gradio 6
 # Chatbot messages format, and passes css/theme to launch() rather than Blocks().
-gradio>=6.0,<7.0
+gradio>=6.20,<7.0
 
 # Configuration and image IO.
-PyYAML>=6.0
-Pillow>=11.0
+PyYAML>=6.0.3
+Pillow>=12.0
 
 # FastAPI backs the optional local REST API. Gradio already depends on it; it is
 # listed explicitly because src/api.py imports it directly.
-fastapi>=0.115
+fastapi>=0.140
 
 # Tests only — safe to skip in a runtime-only install.
-pytest>=8.0
+pytest>=9.0
+
+# ---------------------------------------------------------------------------
+# Do NOT blanket-upgrade this environment (`pip list --outdated` then upgrading
+# everything). Several transitive packages are exact-pinned by their parents,
+# and pip will happily install newer ones that break imports outright:
+#
+#   pydantic-core   pinned == by pydantic; a mismatch is a hard SystemError
+#                   on import, taking gradio and fastapi down with it
+#   tokenizers      pinned <=0.23.0 by transformers, which refuses to import
+#   tomlkit         pinned <0.15.0 by gradio
+#   mpmath          pinned <1.4 by sympy
+#   opencv-python   pinned <5.0 by mflux
+#
+# The nvidia-* / cuda-toolkit wheels are exact-pinned by torch but are in
+# practice compatible across CUDA 13 minor releases: `pip check` complains,
+# while torch and the MLX CUDA backend both verify fine. That divergence is
+# tolerated deliberately, not overlooked.

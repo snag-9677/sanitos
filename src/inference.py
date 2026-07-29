@@ -16,7 +16,7 @@ import logging
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -42,11 +42,18 @@ class InferenceError(RuntimeError):
 
 @dataclass(slots=True)
 class EditRequest:
-    """Everything needed to run one edit."""
+    """Everything needed to run one edit.
 
-    images: list[Image.Image]
+    The image being edited and the extra references are kept apart rather than
+    handed over as one list, because families disagree about which end of that
+    list the edited image belongs on. ``ModelFamily.arrange_images`` resolves
+    the order once, in :meth:`ImageEditor._run`, so no caller has to know.
+    """
+
+    image: Image.Image
     instruction: str
     seed: int
+    references: list[Image.Image] = field(default_factory=list)
     steps: int = 25
     guidance: float = 4.0
     width: int | None = None
@@ -54,9 +61,14 @@ class EditRequest:
     negative_prompt: str = ""
     scheduler: str = ""
 
+    @property
+    def reference_count(self) -> int:
+        return len(self.references)
+
     def __post_init__(self) -> None:
-        if not self.images:
+        if self.image is None:
             raise InferenceError("An image is required before editing.")
+        self.references = [r for r in self.references if r is not None]
         if not self.instruction.strip():
             raise InferenceError("Enter an editing instruction first.")
         self.steps = max(1, int(self.steps))
@@ -104,12 +116,22 @@ class EditResult:
     interrupted: bool = False
     completed_steps: int | None = None
     peak_memory_gb: float = 0.0
+    reference_count: int = 0
+    reference_scale: float = 1.0
 
     def caption(self) -> str:
         parts = [f"{self.width}x{self.height}", f"{self.steps} steps"]
         if self.interrupted and self.completed_steps is not None:
             parts[-1] = f"stopped at {self.completed_steps}/{self.steps} steps"
         parts += [f"guidance {self.guidance:g}", f"seed {self.seed}"]
+        if self.reference_count:
+            note = (
+                f"{self.reference_count} reference"
+                f"{'s' if self.reference_count > 1 else ''}"
+            )
+            if self.reference_scale < 1.0:
+                note += f" @ {self.reference_scale * 100:.0f}%"
+            parts.append(note)
         parts.append(format_duration(self.duration))
         return " · ".join(parts)
 
@@ -287,9 +309,16 @@ def decode_latents(model_handle: EditModel, latents: Any, config: Any) -> Image.
 class ImageEditor:
     """Runs text-guided edits against the loaded model."""
 
-    def __init__(self, model_handle: EditModel, *, enable_previews: bool = True) -> None:
+    def __init__(
+        self,
+        model_handle: EditModel,
+        *,
+        enable_previews: bool = True,
+        reference_scale: float | str = "auto",
+    ) -> None:
         self.model_handle = model_handle
         self.enable_previews = enable_previews
+        self.reference_scale = reference_scale
         self._lock = threading.Lock()
         self.last_duration: float | None = None
 
@@ -324,6 +353,8 @@ class ImageEditor:
         on_progress: ProgressFn | None,
         cancel_event: threading.Event | None,
     ) -> EditResult:
+        self._check_references(request)
+
         if on_progress:
             on_progress(
                 EditProgress(0, request.steps, 0.0, message="Preparing model…")
@@ -360,13 +391,20 @@ class ImageEditor:
         self._reset_registry(registry)
         registry.register(callback)
 
+        scale = self._apply_reference_scale(request)
+
         started = time.perf_counter()
         restore = self._install_encode_barrier(model)
         try:
             with tempfile.TemporaryDirectory(prefix="qwen-edit-") as tmp:
-                # mflux takes image paths, not PIL objects.
-                image_paths = self._write_inputs(request.images, Path(tmp))
+                # mflux takes image paths, not PIL objects. The family decides
+                # whether the edited image leads or trails the references.
+                ordered = self.model_handle.family.arrange_images(
+                    request.image, request.references
+                )
+                image_paths = self._write_inputs(ordered, Path(tmp))
                 result = self._generate(model, request, image_paths, callback, started)
+                result.reference_scale = scale
         finally:
             restore()
             self._reset_registry(registry)
@@ -382,6 +420,93 @@ class ImageEditor:
             result.peak_memory_gb,
         )
         return result
+
+    def _apply_reference_scale(self, request: EditRequest) -> float:
+        """Shrink reference encoding to fit, and report what was chosen.
+
+        The decision needs the output size, so it happens per edit rather than
+        at load time. Only FLUX.2 is patched; Qwen conditions images through a
+        different path, so it keeps mflux's behaviour.
+        """
+        from .references import (
+            apply_reference_scale,
+            fits,
+            largest_fitting_square,
+            resolve_scale,
+            scaled_dimensions,
+        )
+
+        if not request.references or self.model_handle.family.decode_kind != "flux2":
+            apply_reference_scale(1.0)
+            return 1.0
+
+        width = request.width or 1024
+        height = request.height or 1024
+        free_gb = self.model_handle.conditioning_headroom_gb
+
+        try:
+            scale = resolve_scale(
+                self.reference_scale, width, height, request.reference_count, free_gb
+            )
+        except ValueError as exc:
+            raise InferenceError(str(exc)) from exc
+
+        # Even the smallest references can overflow: attention cost is queries
+        # x keys, and the query count is fixed by the output size, so past a
+        # certain resolution no number of small references helps. Refuse now
+        # with a usable suggestion rather than aborting mid-denoise.
+        if not fits(width, height, request.reference_count, scale, free_gb):
+            edge = largest_fitting_square(request.reference_count, free_gb)
+            suggestion = (
+                f"Around {edge}x{edge} or smaller should fit."
+                if edge
+                else "Try a substantially smaller resolution."
+            )
+            raise InferenceError(
+                f"{request.reference_count} reference image"
+                f"{'s' if request.reference_count > 1 else ''} will not fit at "
+                f"{width}x{height} on this GPU, even shrunk to "
+                f"{scale * 100:.0f}%.\n"
+                f"Reference cost is the attention matrix — every output token "
+                f"attends to every reference token — so lowering the output "
+                f"resolution helps far more than removing a reference. "
+                f"{suggestion}"
+            )
+
+        apply_reference_scale(scale)
+        if scale < 1.0:
+            ref_w, ref_h = scaled_dimensions(width, height, scale)
+            logger.info(
+                "References encoded at %dx%d (%.0f%% of %dx%d output) to fit memory.",
+                ref_w, ref_h, scale * 100, width, height,
+            )
+        return scale
+
+    def _check_references(self, request: EditRequest) -> None:
+        """Reject more references than the family takes, before loading weights.
+
+        Checked here rather than in ``EditRequest`` because the limit belongs to
+        whichever model happens to be loaded, and models are switchable at
+        runtime.
+        """
+        family = self.model_handle.family
+        if not request.references:
+            return
+
+        if not family.supports_references:
+            raise InferenceError(
+                f"{family.label} does not take reference images. "
+                f"Remove them, or switch to a model that does."
+            )
+
+        if request.reference_count > family.max_reference_images:
+            raise InferenceError(
+                f"{family.label} takes at most {family.max_reference_images} "
+                f"reference images; {request.reference_count} were supplied.\n"
+                f"Each reference is encoded at the full output size and its "
+                f"tokens are carried through every denoise step, so they cost "
+                f"both memory and time."
+            )
 
     def _generate(
         self,
@@ -424,7 +549,7 @@ class ImageEditor:
                 "steps, or set memory.mode: low in config.yaml."
             ) from exc
         except Exception as exc:  # noqa: BLE001
-            raise InferenceError(self._explain(exc)) from exc
+            raise InferenceError(self._explain(exc, request)) from exc
 
         image = getattr(generated, "image", None)
         if image is None:
@@ -442,6 +567,7 @@ class ImageEditor:
             instruction=request.instruction,
             negative_prompt=request.negative_prompt,
             peak_memory_gb=peak_memory_gb(),
+            reference_count=request.reference_count,
         )
 
     def _salvage(
@@ -477,6 +603,7 @@ class ImageEditor:
             interrupted=True,
             completed_steps=callback.completed_steps,
             peak_memory_gb=peak_memory_gb(),
+            reference_count=request.reference_count,
         )
 
     def _install_encode_barrier(self, model: Any) -> Callable[[], None]:
@@ -554,15 +681,37 @@ class ImageEditor:
             if isinstance(listeners, list):
                 listeners.clear()
 
-    @staticmethod
-    def _explain(exc: Exception) -> str:
+    def _explain(self, exc: Exception, request: EditRequest | None = None) -> str:
         text = str(exc)
         lowered = text.lower()
         if "out of memory" in lowered or "insufficient" in lowered:
-            return (
-                f"Out of memory: {text}\n"
-                "Try 512 or 768 resolution, fewer steps, or memory.mode: low."
-            )
+            # Reference images are the cheapest thing to give up and the most
+            # likely cause when they are in play, so they lead the advice.
+            references = request.reference_count if request else 0
+            if references:
+                remedy = (
+                    f"This edit carried {references} reference image"
+                    f"{'s' if references > 1 else ''}, each encoded at the full "
+                    f"output size and attended to on every step. Removing one is "
+                    f"usually the cheapest fix; otherwise drop the resolution "
+                    f"preset."
+                )
+            # Recommending low mode to someone already in it wastes the one
+            # message they get, so the advice reflects where they actually are.
+            elif self.model_handle.memory_mode == "low":
+                remedy = (
+                    "The text encoder is already being freed before denoising, "
+                    "so the remaining options are a smaller resolution preset "
+                    "or a smaller model."
+                )
+            else:
+                remedy = (
+                    f"Memory mode is {self.model_handle.memory_mode!r}, which keeps "
+                    "the text encoder resident for the whole run. Set "
+                    "memory.mode: low in config.yaml to free it after encoding, "
+                    "or drop to a smaller resolution preset."
+                )
+            return f"Out of memory: {text}\n{remedy}"
         if "shape" in lowered or "broadcast" in lowered:
             return (
                 f"Tensor shape error: {text}\n"

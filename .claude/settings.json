@@ -1,0 +1,61 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv)",
+      "Bash(grep -iE \"^MLX_[A-Z_]+$\")",
+      "Bash(./venv/bin/python -c ' *)",
+      "Bash(MLX_USE_CUDA_GRAPHS=0 timeout 900 ./venv/bin/python -u outputs/_oom_check.py 3)",
+      "Bash(./venv/bin/pip show *)",
+      "Bash(nm -D --defined-only venv/lib/python3.12/site-packages/mlx/lib/libmlx.so)",
+      "Bash(c++filt)",
+      "Bash(nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader)",
+      "Bash(VAE_TILING=0 PREVIEWS=0 timeout 900 ./venv/bin/python -u outputs/_oom_check.py 2 512 512)",
+      "Bash(nvidia-smi --query-gpu=memory.used --format=csv,noheader)",
+      "Bash(timeout 600 ./venv/bin/python -u outputs/_vae_check.py 512 512)",
+      "Bash(MLX_USE_CUDA_GRAPHS=0 timeout 600 ./venv/bin/python -u outputs/_vae_check.py 512 512)",
+      "Bash(VAE_CPU=1 timeout 900 ./venv/bin/python -u outputs/_vae_check.py 512 512)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(./venv/bin/pip index *)",
+      "Bash(./venv/bin/pip list *)",
+      "Bash(/home/ankith/snag/sanitos/venv/bin/pip index *)",
+      "Bash(/home/ankith/snag/sanitos/venv/bin/pip show *)",
+      "Bash(nm -D --defined-only venv/lib/python3.12/site-packages/mlx_cuda_13/lib/libmlx.so)",
+      "Bash(./venv/bin/pip freeze *)",
+      "Read(//tmp/**)",
+      "Bash(MLX_USE_CUDA_GRAPHS=0 timeout 60 /home/ankith/snag/sanitos/venv/bin/python -c ' *)",
+      "Bash(python3.12 -m venv mlx032)",
+      "Bash(./mlx032/bin/pip install *)",
+      "Bash(./mlx032/bin/python -c \"import mlx.core as mx; print\\(mx.__version__\\)\")",
+      "Bash(./venv/bin/pip install *)",
+      "Bash(timeout 300 ./venv/bin/python -u -c ' *)",
+      "Bash(timeout 600 ./venv/bin/python -u outputs/_vae_check.py 1024 1024)",
+      "Bash(./venv/bin/python -m pytest tests/ -q)",
+      "Bash(./venv/bin/python app.py --check)",
+      "Bash(./venv/bin/pip check *)",
+      "Bash(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader)",
+      "Bash(ps -p 1181488 -o pid,etime,cmd --no-headers)",
+      "Bash(ps -p 1187215 -o cmd --no-headers)",
+      "Bash(python3 -)",
+      "Bash(rm -f /tmp/claude-1000/-home-ankith-snag-sanitos/abe05988-fc6a-422f-bfaa-f01c90529b24/scratchpad/*.py /tmp/claude-1000/-home-ankith-snag-sanitos/abe05988-fc6a-422f-bfaa-f01c90529b24/scratchpad/*.png)",
+      "Bash(./venv/bin/python -m py_compile src/ui.py)",
+      "Bash(timeout 1800 ./venv/bin/python -u /tmp/claude-1000/-home-ankith-snag-sanitos/abe05988-fc6a-422f-bfaa-f01c90529b24/scratchpad/autofit.py)",
+      "Bash(timeout 600 ./venv/bin/python -u /tmp/claude-1000/-home-ankith-snag-sanitos/abe05988-fc6a-422f-bfaa-f01c90529b24/scratchpad/sdpa_scaling.py)",
+      "Bash(/home/ankith/snag/sanitos/venv/bin/python -c \"import mlx.core as mx; print\\(mx.__version__\\); print\\(mx.default_device\\(\\)\\); import mlx; print\\(mlx.__file__\\)\")",
+      "Bash(/home/ankith/snag/sanitos/venv/bin/pip list *)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(./venv/bin/python -)",
+      "Bash(*)",
+      "WebFetch(domain:huggingface.co)",
+      "WebFetch(domain:docs.bfl.ai)",
+      "WebFetch(domain:runware.ai)",
+      "Bash(./venv/bin/python -m py_compile src/references.py)"
+    ],
+    "additionalDirectories": [
+      "/tmp/claude-1000/-home-ankith-snag-sanitos/abe05988-fc6a-422f-bfaa-f01c90529b24/scratchpad"
+    ]
+  },
+  "enabledPlugins": {
+    "context7@claude-plugins-official": true
+  }
+}

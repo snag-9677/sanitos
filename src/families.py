@@ -18,6 +18,7 @@ the startup advice, so they are per-family rather than hardcoded.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -61,6 +62,17 @@ class ModelFamily:
     # footprint so much larger than the quantised families.
     text_encoder_unquantised: bool = False
 
+    # Where the image being edited sits in the image_paths list, and how many
+    # extra reference images the pipeline will take alongside it.
+    #
+    # Families disagree about this, and getting it wrong is silent rather than
+    # loud: FLUX.2 reads image_paths[0] as the image to edit, while Qwen takes
+    # image_paths[-1] (it derives the output dimensions from that one). Append
+    # references naively and Qwen edits the last reference instead of the
+    # source, producing a plausible image of the wrong thing.
+    primary_image_position: str = "first"
+    max_reference_images: int = 0
+
     # How packed latents map back to an image; see inference.decode_latents.
     decode_kind: str = "flux2"
     notes: str = ""
@@ -74,6 +86,22 @@ class ModelFamily:
     def denoise_peak_gb(self) -> float:
         """Peak once the text encoder has been released."""
         return self.transformer_gb + self.vae_gb
+
+    @property
+    def supports_references(self) -> bool:
+        return self.max_reference_images > 0
+
+    def arrange_images(self, source: Any, references: Sequence[Any]) -> list[Any]:
+        """Order the image list the way this family's pipeline expects.
+
+        The caller only knows "this is the image being edited, these are
+        references"; which end of the list the source belongs on is a property
+        of the pipeline, so it is resolved here rather than at the call site.
+        """
+        ordered = list(references)
+        if self.primary_image_position == "last":
+            return [*ordered, source]
+        return [source, *ordered]
 
     def load_pipeline_class(self) -> type:
         module = __import__(self.module, fromlist=[self.class_name])
@@ -149,6 +177,17 @@ FAMILIES: dict[str, ModelFamily] = {
         default_steps=28,
         guidance_range=(1.0, 6.0),
         encode_method="_encode_prompt_pair",
+        # Each reference is VAE-encoded at the output size, patchified, and its
+        # tokens concatenated onto the conditioning stream with its own
+        # temporal coordinate, so the model can tell the references apart.
+        #
+        # 4 is what Black Forest Labs' own API allows for Klein. mflux imposes
+        # no cap of its own, and memory is not what this number guards — that
+        # is src/references.py, which prices the whole attention stream and
+        # refuses or shrinks per edit. So this is a capability limit, and the
+        # count that actually fits depends on the output resolution.
+        primary_image_position="first",
+        max_reference_images=4,
         transformer_gb=9.6,
         text_encoder_gb=8.0,
         vae_gb=0.2,
@@ -171,6 +210,10 @@ FAMILIES: dict[str, ModelFamily] = {
         default_steps=28,
         guidance_range=(1.0, 6.0),
         encode_method="_encode_prompt_pair",
+        # Same 4-reference ceiling as the 9B; far smaller weights, so more of
+        # the memory budget is left for the conditioning stream.
+        primary_image_position="first",
+        max_reference_images=4,
         transformer_gb=3.2,
         text_encoder_gb=3.3,
         vae_gb=0.2,
@@ -190,6 +233,12 @@ FAMILIES: dict[str, ModelFamily] = {
         default_steps=25,
         guidance_range=(1.0, 10.0),
         encode_method="_encode_prompts_with_images",
+        # Qwen sizes the output from image_paths[-1], so the image being edited
+        # has to be last or it will edit a reference instead. 2509 is the
+        # multi-image release of this model; 3 references is its documented
+        # working range.
+        primary_image_position="last",
+        max_reference_images=3,
         transformer_gb=16.6,
         text_encoder_gb=15.5,
         vae_gb=0.25,

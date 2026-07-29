@@ -13,6 +13,15 @@ Example:
       -F image=@photo.jpg \\
       -F 'instruction=change the shirt colour to blue' \\
       -F steps=25 -o edited.png
+
+``image`` is the one being edited. Repeat ``reference`` to pass extra views of
+the same subject for the model to draw on (``references`` as a list of base64
+strings in the JSON form); they condition the edit and are never edited:
+
+    curl -X POST http://127.0.0.1:7860/api/edit \\
+      -F image=@front.jpg \\
+      -F reference=@left.jpg -F reference=@right.jpg \\
+      -F 'instruction=a sharp studio portrait of this person' -o out.png
 """
 
 from __future__ import annotations
@@ -66,7 +75,11 @@ def mount_api(demo: Any, config: AppConfig, model: EditModel) -> None:
         logger.warning("Gradio app not exposed; REST API disabled.")
         return
 
-    editor = ImageEditor(model, enable_previews=False)
+    editor = ImageEditor(
+        model,
+        enable_previews=False,
+        reference_scale=config.memory.reference_scale,
+    )
     gen = config.generation
 
     @app.get("/api/health")
@@ -112,10 +125,12 @@ def mount_api(demo: Any, config: AppConfig, model: EditModel) -> None:
         height: int | None,
         negative_prompt: str,
         as_json: bool,
+        references: list[Image.Image] | None = None,
     ) -> Response:
         try:
             request = EditRequest(
-                images=[image],
+                image=image,
+                references=references or [],
                 instruction=instruction,
                 seed=coerce_seed(seed),
                 steps=steps,
@@ -147,6 +162,7 @@ def mount_api(demo: Any, config: AppConfig, model: EditModel) -> None:
                     "height": result.height,
                     "duration_seconds": round(result.duration, 2),
                     "peak_memory_gb": round(result.peak_memory_gb, 2),
+                    "reference_count": result.reference_count,
                 }
             )
 
@@ -164,6 +180,7 @@ def mount_api(demo: Any, config: AppConfig, model: EditModel) -> None:
     async def edit_multipart(
         request: Request,
         image: UploadFile | None = File(default=None),
+        reference: list[UploadFile] = File(default=[]),
         instruction: str = Form(default=""),
         steps: int = Form(default=gen.steps),
         guidance: float = Form(default=gen.guidance),
@@ -177,11 +194,13 @@ def mount_api(demo: Any, config: AppConfig, model: EditModel) -> None:
         if image is not None:
             try:
                 pil = _decode_image(await image.read())
+                refs = [_decode_image(await r.read()) for r in reference or []]
             except ImageError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             return await _run(
                 pil, instruction, steps, guidance, seed or None,
                 width, height, negative_prompt, response_format == "json",
+                references=refs,
             )
 
         try:
@@ -198,6 +217,7 @@ def mount_api(demo: Any, config: AppConfig, model: EditModel) -> None:
 
         try:
             pil = _decode_image(body["image"])
+            refs = [_decode_image(r) for r in body.get("references") or []]
         except ImageError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -211,6 +231,7 @@ def mount_api(demo: Any, config: AppConfig, model: EditModel) -> None:
             body.get("height"),
             body.get("negative_prompt", ""),
             body.get("response_format", "json") == "json",
+            references=refs,
         )
 
     logger.info("REST API mounted at /api/edit, /api/status, /api/health")
