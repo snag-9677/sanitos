@@ -1,12 +1,15 @@
-# Qwen Image Edit — Apple Silicon (M5)
+# Local Image Edit — Apple Silicon (M5)
 
 Local, fully offline, text-guided image editing. Upload a photo, say what you
 want changed, and keep refining — each edit builds on the last, like a
 conversation with the image.
 
-Runs **Qwen-Image-Edit-2509 at 6-bit** on the Apple GPU via Metal — or on an
-NVIDIA GPU under Linux. No cloud APIs, no telemetry. Once the weights are
-downloaded you can unplug the network.
+Runs **FLUX.2 Klein 9B at 8-bit** on the Apple GPU via Metal — or on an NVIDIA
+GPU under Linux. No cloud APIs, no telemetry. Once the weights are downloaded
+you can unplug the network.
+
+Qwen-Image-Edit is also supported, but does not fit in 24 GB — see
+[Choosing a model](#choosing-a-model).
 
 ```
 python app.py
@@ -68,8 +71,8 @@ Qwen-Image-Edit responds well to explicit preservation clauses — adding
 | Hardware | Apple Silicon Mac (M1 or later). Developed and tested on **M5, 24 GB**. |
 | macOS | 13 Ventura or later (26.x tested) |
 | Python | 3.11+ (3.12 recommended) |
-| Disk | ~35 GB free — the model is ~32 GB |
-| RAM | 24 GB workable with `memory.mode: low`; 32 GB+ comfortable |
+| Disk | ~22 GB free — the default model is ~18 GB |
+| RAM | 16 GB workable; **24 GB comfortable** with the default model |
 
 Intel Macs are not supported for practical use: there is no Metal GPU path, and
 CPU-only inference takes well over an hour per image.
@@ -106,7 +109,7 @@ AMD/ROCm and Apple Intel have no MLX GPU backend, so both fall back to CPU.
 ## Install
 
 On a new machine, one command does everything — environment, dependencies, and
-the ~32 GB of weights:
+the ~18 GB of weights:
 
 ```bash
 ./setup.sh
@@ -184,7 +187,7 @@ as a cryptic error at load time.
 ### First-time model download
 
 Nothing is downloaded at install time. On the **first edit** the app fetches
-~32 GB from HuggingFace into `models/hf/` (configurable via `model.cache_dir`).
+~18 GB from HuggingFace into `models/hf/` (configurable via `model.cache_dir`).
 Expect 20–45 minutes on a fast connection. Downloads resume if interrupted.
 
 To fetch the weights up front instead of on first edit:
@@ -257,9 +260,12 @@ stopped. HuggingFace's Xet backend has been known to throttle; setting
 | Setting | Value | Note |
 |---|---|---|
 | Resolution | **Balanced — match input, 0.6 MP** | Best quality-per-second on a 10-core GPU |
-| Steps | **25** | 12–15 for quick iteration, 30+ for finals |
-| Guidance | **4.0** | 2.5–3.0 for subtle edits, 5–6 to force compliance |
-| Memory mode | **`low`** | Essential at 24 GB |
+| Steps | **28** | 12–16 for quick iteration, 40+ for finals |
+| Guidance | **1.0** | FLUX.2 is distilled — it wants ~1.0, not the 4.0 a Qwen/SD model needs |
+| Memory mode | **`balanced`** | The model fits; nothing needs evicting |
+
+FLUX.2 **does not accept a negative prompt** — the field is ignored for this
+family. Describe what you *want* instead of what you don't.
 
 The "match input" presets size to a pixel budget while **preserving the source
 aspect ratio** — a landscape photo stays landscape. Prefer these; the fixed
@@ -271,50 +277,153 @@ re-run the instruction you settled on at *Quality — 1.0 MP* with the same seed
 
 ---
 
+## Choosing a model
+
+Models are switchable at runtime — pick one from the **Model** dropdown in the
+UI and the current model is unloaded and the new one loaded, no restart needed.
+Weights download on first selection.
+
+```bash
+python app.py --list-models        # what's available, sizes, what's cached
+python app.py --model flux2-klein-4b
+```
+
+```
+  Selectable models  (machine has 24 GB)
+
+  * flux2-klein-9b    17.8 GB  fits     cached          FLUX.2 Klein 9B (8-bit)
+      Best quality that fits a 24 GB machine. Recommended.
+    flux2-klein-4b     6.7 GB  fits     not downloaded  FLUX.2 Klein 4B (6-bit)
+      Fastest. Lower fidelity; good for exploring wording.
+    qwen-6bit         32.4 GB  TOO BIG  cached          Qwen-Image-Edit 2509 (6-bit)
+      Needs 40 GB+. On 24 GB it swaps badly — ~116 s per step.
+```
+
+The dropdown labels carry the size and a warning when a model is larger than
+the machine, so the consequence is visible before you pick it.
+
+Selecting a model also moves the settings that belong to it: FLUX.2 wants
+`guidance ≈ 1.0` and **rejects negative prompts**, so that field is hidden;
+Qwen wants `guidance ≈ 4.0` and keeps it. `memory.mode: auto` re-decides
+per model whether the text encoder needs evicting.
+
+Add your own in `config.yaml` — `repo_id` and `family` must match, and startup
+validates that they do:
+
+```yaml
+model:
+  active: "flux2-klein-9b"
+  catalog:
+    - id: "flux2-klein-9b"
+      label: "FLUX.2 Klein 9B (8-bit)"
+      repo_id: "mlx-community/flux2-klein-9b-8bit"
+      family: "flux2-klein-edit"
+      notes: "Best quality that fits a 24 GB machine."
+```
+
+| `family` | Pipeline | Working set |
+|---|---|---|
+| `flux2-klein-edit` | FLUX.2 Klein 9B | 17.9 GB |
+| `flux2-klein-edit-4b` | FLUX.2 Klein 4B | 6.7 GB |
+| `qwen-image-edit` | Qwen-Image-Edit 2509 | 32.4 GB |
+
+### Running out of GPU memory
+
+On Apple Silicon an oversized model spills into system RAM and merely gets
+slow. On a **discrete GPU there is no swap** — exceeding VRAM aborts the
+process from inside the CUDA allocator:
+
+```
+terminate called after throwing an instance of 'std::runtime_error'
+  what():  cudaMallocAsync(&data, size, stream) failed: out of memory
+```
+
+That is a C++ abort, not a Python exception, so no handler can catch it. The
+app therefore does two things on a discrete GPU:
+
+* **Preflight.** Before loading, it compares the model's working set (or its
+  denoise peak in `low` mode) plus ~2 GB of activation headroom against
+  available VRAM, and refuses with an explanation naming smaller models.
+* **A memory limit.** `mx.set_memory_limit()` is set to ~92% of VRAM, so MLX
+  raises a catchable Python error rather than letting the allocator abort.
+
+If you hit this anyway, in order of effectiveness: switch to a smaller model,
+set `memory.mode: low`, drop the resolution preset, lower `steps`.
+
+### Why Qwen-Image-Edit does not fit in 24 GB
+
+This is worth spelling out, because quantising harder does not fix it.
+
+| Component | Qwen-Image-Edit 6-bit | FLUX.2 Klein 9B 8-bit |
+|---|---|---|
+| Transformer | 16.6 GB (6-bit) | 9.6 GB (8-bit) |
+| Text encoder | **15.5 GB — bf16, not quantised** | 8.0 GB (8-bit) |
+| VAE | 0.25 GB | 0.2 GB |
+| **Total** | **32.4 GB** | **17.9 GB** |
+
+mflux marks Qwen's text encoder `skip_quantization=True` because quantising it
+noticeably degrades prompt understanding. That is a defensible trade, but it
+sets a hard floor: even the 4-bit Qwen export still totals **27.3 GB**, because
+only the transformer shrinks. Every FLUX.2 component is quantised, which is the
+entire difference.
+
+**Measured on an M5 / 24 GB**, Qwen-Image-Edit at 512 px, 12 steps:
+
+```
+peak memory   32.2 GB      ← the full working set, on a 24 GB machine
+swap used     17.0 GB
+pageins       20.5 million
+per step      116 s        → 23 minutes for one edit
+```
+
+The output was correct; it was just unusable. If you have 40 GB or more,
+`family: qwen-image-edit` is a reasonable choice.
+
+### A note on lazy evaluation
+
+If you run Qwen on a constrained machine, one detail matters enough to record.
+
+MLX evaluates lazily. `_encode_prompts_with_images` does not return
+embeddings — it returns an *unevaluated graph* that still references all
+15.5 GB of the text encoder's weights. Dropping the module afterwards therefore
+frees nothing: the weights stay alive until the graph is finally forced, at the
+first `mx.eval()` **inside the denoise loop** — exactly when the transformer is
+also materialising. Both are resident at once.
+
+`ImageEditor._install_encode_barrier` inserts an explicit `mx.eval` on the
+embeddings before eviction, collapsing the graph while the transformer is still
+untouched. Without it, `memory.mode: low` silently does nothing.
+
+---
+
 ## How it works, and why it isn't PyTorch MPS
 
-The brief asked for PyTorch MPS. That path cannot deliver a 6-bit model today:
+The brief asked for PyTorch MPS. That path cannot deliver a quantised model on
+Apple Silicon today:
 
 * `bitsandbytes` is CUDA-only.
 * `torchao` has no 6-bit kernels on Apple GPUs.
 * diffusers' GGUF loader dequantises back to bf16 at compute time, so it saves
   disk, not memory.
 
-Qwen-Image-Edit's transformer is 20B parameters — roughly **40 GB at bf16**,
-which does not fit in 24 GB of unified memory. The only real 6-bit
-Qwen-Image-Edit weights are published in **mflux/MLX** format, and MLX runs on
-the same Apple GPU through the same Metal backend. So the compute path is
-MLX/Metal rather than torch/MPS; the hardware being driven is identical.
+These transformers are 9–20B parameters — tens of GB at bf16, well beyond
+24 GB of unified memory. The quantised weights that do fit are published in
+**mflux/MLX** format, and MLX runs on the same Apple GPU through the same Metal
+backend. So the compute path is MLX/Metal rather than torch/MPS; the hardware
+being driven is identical.
 
 PyTorch MPS availability is still probed and printed at startup, because torch
 comes along as an mflux dependency and it is the first thing people check when
 asking "is my GPU actually being used?"
 
-### Memory
+### Memory modes
 
-The model does not split evenly:
-
-| Component | Size | Precision |
+| Mode | Behaviour | Use when |
 |---|---|---|
-| Transformer | 16.6 GB | 6-bit (U32-packed + bf16 scales) |
-| Text encoder | 15.5 GB | **bf16 — deliberately not quantised** |
-| VAE | 0.25 GB | bf16 |
-| **Total** | **~32.4 GB** | |
-
-The text encoder is left at bf16 on purpose: mflux marks it
-`skip_quantization=True` because 6-bit noticeably degrades prompt
-understanding. That is the right trade, but it means a 32 GB working set on a
-24 GB machine.
-
-The text encoder only runs once per edit, at the start; the transformer runs on
-every denoise step. So `memory.mode: low` evicts the encoder the moment the
-prompt is encoded and lazily reloads it on the next turn:
-
-| Mode | Denoise peak | Trade-off |
-|---|---|---|
-| `low` | **~16.9 GB** | Reloads the encoder (~10–25 s) on turns that re-encode. Best for 24 GB. |
-| `balanced` | ~32 GB | No reload; relies on macOS paging the idle encoder out. Best for 32 GB+. |
-| `off` | ~32 GB | No management at all. |
+| `auto` | Pick per model: `balanced` if it fits, `low` if not | **Default** — correct as you switch models |
+| `balanced` | Everything stays resident | The model fits |
+| `low` | Evict the text encoder after encoding, reload next turn | The model does not fit (Qwen under ~40 GB) |
+| `off` | No management at all | Debugging |
 
 > mflux ships a `MemorySaver` that performs the same eviction but never
 > reloads, so a second edit with a new prompt would fail. This app owns that
@@ -329,15 +438,16 @@ resolve against the project directory, and `~` / `${ENV_VAR}` are expanded.
 
 ```yaml
 model:
-  repo_id: "OsaurusAI/Qwen-Image-Edit-mflux-q6"   # or a local directory
+  repo_id: "mlx-community/flux2-klein-9b-8bit"   # or a local directory
+  family:  "flux2-klein-edit"
   cache_dir: "./models/hf"
 
 memory:
-  mode: "low"                 # low | balanced | off
+  mode: "auto"                # auto | balanced | low | off
 
 generation:
-  steps: 25
-  guidance: 4.0
+  steps: 28
+  guidance: 1.0
 
 ui:
   server_port: 7860
@@ -346,16 +456,18 @@ ui:
 Use a different file with `python app.py --config other.yaml` or
 `QWEN_EDIT_CONFIG=other.yaml`.
 
-### Model choice
+### Verify weights after switching models
 
-`OsaurusAI/Qwen-Image-Edit-mflux-q6` is the default because it is a complete
-6-bit mflux export of `Qwen/Qwen-Image-Edit-2509`.
+Repos can be published broken. `Norton0924/Qwen-Image-Edit-2509-6bit` ships
+`text_encoder/2.safetensors` at 67 MB while its own header declares 2.06 GB of
+tensor data — it cannot load, and MLX reports it as an opaque "invalid data
+offsets" error. After changing `repo_id`, run:
 
-> The other 6-bit export, `Norton0924/Qwen-Image-Edit-2509-6bit`, is **broken
-> upstream**: its `text_encoder/2.safetensors` is published at 67 MB while its
-> own header declares 2.06 GB of tensor data. It cannot load. Run
-> `python app.py --verify` after switching `repo_id` to catch this class of
-> problem before it turns into an opaque MLX error.
+```bash
+python app.py --verify
+```
+
+which names the offending file instead.
 
 ---
 
@@ -413,6 +525,7 @@ qwen-image-edit-m5/
 ├── outputs/            images, metadata, sessions, logs
 ├── src/
 │   ├── config.py       typed config loading + validation
+│   ├── families.py     per-model API/memory differences
 │   ├── device.py       Apple Silicon detection, Metal probe, banner
 │   ├── model_loader.py loading, memory modes, integrity verification
 │   ├── inference.py    generation loop, previews, cancellation
@@ -459,9 +572,14 @@ the startup banner reports its status since it's a common sanity check.
 
 **Out of memory / heavy swapping**
 
-Set `memory.mode: low`, drop to 512 or 768, and lower `steps`. Quit other large
-apps: 24 GB is genuinely tight for a 32 GB working set. Watch the real number
-with `python app.py` and the memory line in `/api/status`.
+First check which model you are on — `python app.py --check` prints the working
+set and whether it fits. If it says *Tight* or *Constrained*, you are on a model
+too large for this machine; switch to `flux2-klein-edit` (see
+[Choosing a model](#choosing-a-model)).
+
+If the model does fit and you are still short: drop to a smaller resolution
+preset, lower `steps`, and quit other large apps. Watch the live figure in the
+status line under the composer, or in `/api/status`.
 
 **"invalid data offsets" / "incomplete download"**
 
@@ -477,7 +595,7 @@ If it fails again on the same file, the upstream repo itself is broken — switc
 
 **First edit takes forever**
 
-The first edit downloads ~32 GB and then loads it. Later launches load from
+The first edit downloads the weights (~18 GB by default) and then loads them. Later launches load from
 cache in tens of seconds. Use `python app.py --preload` to front-load this.
 
 **Port already in use**
@@ -496,6 +614,7 @@ Chaining two simple instructions usually beats one compound instruction.
 
 ## Licence and attribution
 
-* Model: [Qwen-Image-Edit-2509](https://huggingface.co/Qwen/Qwen-Image-Edit-2509) (Apache 2.0), 6-bit MLX export by [OsaurusAI](https://huggingface.co/OsaurusAI/Qwen-Image-Edit-mflux-q6)
+* Default model: [FLUX.2 Klein](https://huggingface.co/black-forest-labs), 8-bit MLX export by [mlx-community](https://huggingface.co/mlx-community/flux2-klein-9b-8bit)
+* Also supported: [Qwen-Image-Edit-2509](https://huggingface.co/Qwen/Qwen-Image-Edit-2509) (Apache 2.0), 6-bit export by [OsaurusAI](https://huggingface.co/OsaurusAI/Qwen-Image-Edit-mflux-q6)
 * Inference: [mflux](https://github.com/filipstrand/mflux) — MLX implementations of generative image models
 * UI: [Gradio](https://gradio.app)

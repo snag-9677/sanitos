@@ -78,21 +78,59 @@ class StylePreset:
 
 
 @dataclass(slots=True)
+class ModelEntry:
+    """One selectable model: a weights repo paired with the pipeline for it."""
+
+    id: str
+    label: str
+    repo_id: str
+    family: str
+    notes: str = ""
+
+    def __post_init__(self) -> None:
+        from .families import FAMILIES
+
+        if not self.repo_id:
+            raise ConfigError(f"Model {self.id!r} has an empty repo_id.")
+        if self.family not in FAMILIES:
+            raise ConfigError(
+                f"Model {self.id!r} has family {self.family!r}; "
+                f"expected one of {sorted(FAMILIES)}."
+            )
+
+    @property
+    def size_gb(self) -> float:
+        from .families import get_family
+
+        return get_family(self.family).working_set_gb
+
+    def describe(self, memory_gb: float = 0.0) -> str:
+        """Dropdown label: name, size, and whether it fits this machine."""
+        text = f"{self.label} · {self.size_gb:.0f} GB"
+        if memory_gb and self.size_gb > memory_gb - 2:
+            text += "  \u26a0 larger than this machine"
+        return text
+
+
+@dataclass(slots=True)
 class ModelConfig:
     repo_id: str
     cache_dir: Path
     # Which mflux pipeline drives this repo; see src/families.py.
     family: str = "flux2-klein-edit"
+    # Selectable models, offered in the UI and via --model.
+    catalog: list[ModelEntry] = field(default_factory=list)
+    active: str = ""
     quantize: int | None = None
     preload: bool = False
     lora_paths: list[str] = field(default_factory=list)
     lora_scales: list[float] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        if not self.repo_id:
-            raise ConfigError("model.repo_id must not be empty.")
         from .families import FAMILIES
 
+        if not self.repo_id:
+            raise ConfigError("model.repo_id must not be empty.")
         if self.family not in FAMILIES:
             raise ConfigError(
                 f"model.family must be one of {sorted(FAMILIES)}, got {self.family!r}."
@@ -103,14 +141,74 @@ class ModelConfig:
                 f"model.lora_scales has {len(self.lora_scales)}; they must match."
             )
 
+        ids = [entry.id for entry in self.catalog]
+        duplicates = {i for i in ids if ids.count(i) > 1}
+        if duplicates:
+            raise ConfigError(f"Duplicate model ids in model.catalog: {sorted(duplicates)}")
+
+        # Whatever repo_id/family point at stays selectable, so a config with no
+        # catalog still works and a hand-edited repo_id still appears in the UI.
+        if not any(e.repo_id == self.repo_id and e.family == self.family for e in self.catalog):
+            self.catalog.insert(
+                0,
+                ModelEntry(
+                    id="configured",
+                    label=self.repo_id.split("/")[-1],
+                    repo_id=self.repo_id,
+                    family=self.family,
+                    notes="From model.repo_id in config.yaml.",
+                ),
+            )
+            ids.insert(0, "configured")
+
+        if self.active and self.active not in ids:
+            raise ConfigError(
+                f"model.active is {self.active!r}, which is not in model.catalog "
+                f"({sorted(ids)})."
+            )
+        if not self.active:
+            self.active = self.entry_for_repo(self.repo_id).id
+
+    def entry(self, model_id: str) -> ModelEntry:
+        for candidate in self.catalog:
+            if candidate.id == model_id:
+                return candidate
+        raise ConfigError(
+            f"No model with id {model_id!r}. "
+            f"Available: {sorted(e.id for e in self.catalog)}"
+        )
+
+    def entry_for_repo(self, repo_id: str) -> ModelEntry:
+        for candidate in self.catalog:
+            if candidate.repo_id == repo_id:
+                return candidate
+        return self.catalog[0]
+
+    @property
+    def active_entry(self) -> ModelEntry:
+        return self.entry(self.active)
+
 
 @dataclass(slots=True)
 class MemoryConfig:
-    mode: str = "low"
+    mode: str = "auto"
     cache_limit_bytes: int | None = 1024**3
     vae_tiling: bool = True
 
-    VALID_MODES = ("balanced", "low", "off")
+    VALID_MODES = ("auto", "balanced", "low", "off")
+
+    def resolve(self, working_set_gb: float, available_gb: float) -> str:
+        """Turn ``auto`` into a concrete mode for the selected model.
+
+        Eviction costs a text-encoder reload every turn, so it is only worth
+        paying when the model genuinely does not fit. Models are switchable at
+        runtime now, so this is decided per model rather than once in the file.
+        """
+        if self.mode != "auto":
+            return self.mode
+        if available_gb <= 0:
+            return "balanced"
+        return "balanced" if working_set_gb <= available_gb - 2 else "low"
 
     def __post_init__(self) -> None:
         if self.mode not in self.VALID_MODES:
@@ -203,6 +301,21 @@ def _preset_list(raw: Any) -> list[ResolutionPreset]:
     return presets
 
 
+def _catalog(raw: Any) -> list[ModelEntry]:
+    entries: list[ModelEntry] = []
+    for item in raw or []:
+        entries.append(
+            ModelEntry(
+                id=str(item["id"]),
+                label=str(item.get("label") or item["id"]),
+                repo_id=str(item["repo_id"]),
+                family=str(item["family"]),
+                notes=str(item.get("notes") or ""),
+            )
+        )
+    return entries
+
+
 def _style_list(raw: Any) -> list[StylePreset]:
     return [
         StylePreset(label=str(item["label"]), prompt=str(item["prompt"]))
@@ -253,6 +366,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
             repo_id=str(model_raw.get("repo_id", "")).strip(),
             cache_dir=resolve_path(model_raw.get("cache_dir", "./models/hf"), root=root),
             family=str(model_raw.get("family", "flux2-klein-edit")).strip(),
+            catalog=_catalog(model_raw.get("catalog")),
+            active=str(model_raw.get("active", "")).strip(),
             quantize=model_raw.get("quantize"),
             preload=bool(model_raw.get("preload", False)),
             lora_paths=list(model_raw.get("lora_paths") or []),

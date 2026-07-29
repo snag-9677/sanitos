@@ -17,10 +17,33 @@ model:
   repo_id: "mlx-community/flux2-klein-9b-8bit"
 
   # Which mflux pipeline drives this repo. See src/families.py.
-  #   flux2-klein-edit     FLUX.2 Klein 9B   ~17.9 GB   (default)
-  #   flux2-klein-edit-4b  FLUX.2 Klein 4B    ~6.7 GB   fastest
-  #   qwen-image-edit      Qwen-Image-Edit   ~32.4 GB   needs 40 GB+
   family: "flux2-klein-edit"
+
+  # Models offered in the UI's picker and via `--model <id>`. Switching is a
+  # runtime operation: the current model is unloaded and the new one loaded,
+  # so no restart is needed. Weights download on first selection.
+  #
+  # `repo_id` and `family` must match — the weights and the pipeline that
+  # drives them are a pair. Startup validates this.
+  catalog:
+    - id: "flux2-klein-9b"
+      label: "FLUX.2 Klein 9B (8-bit)"
+      repo_id: "mlx-community/flux2-klein-9b-8bit"
+      family: "flux2-klein-edit"
+      notes: "Best quality that fits a 24 GB machine. Recommended."
+    - id: "flux2-klein-4b"
+      label: "FLUX.2 Klein 4B (6-bit)"
+      repo_id: "mlx-community/FLUX.2-Klein-4B-6bit"
+      family: "flux2-klein-edit-4b"
+      notes: "Fastest. Lower fidelity; good for exploring wording."
+    - id: "qwen-6bit"
+      label: "Qwen-Image-Edit 2509 (6-bit)"
+      repo_id: "OsaurusAI/Qwen-Image-Edit-mflux-q6"
+      family: "qwen-image-edit"
+      notes: "Needs 40 GB+. On 24 GB it swaps badly — ~116 s per step."
+
+  # Which catalog entry to start with. Defaults to whatever repo_id names.
+  active: "flux2-klein-9b"
 
   # Where weights are cached. This becomes HF_HOME, so downloads land inside
   # the project instead of ~/.cache/huggingface. ~18 GB on first launch.
@@ -40,16 +63,16 @@ model:
   lora_scales: []
 
 memory:
-  # How to manage the working set. FLUX.2 Klein 9B is 17.9 GB, which fits in
-  # 24 GB with headroom, so nothing needs evicting.
+  # How to manage the working set.
   #
-  #   balanced  Keep every component resident. Correct whenever the model fits
-  #             in memory — no eviction, no reload, fastest per edit.
+  #   auto      Pick per model: `balanced` when the model fits in memory,
+  #             `low` when it does not. Correct as you switch models.
+  #   balanced  Keep every component resident — no eviction, no reload.
   #   low       Evict the text encoder after each prompt encode and lazily
-  #             reload it next turn. Only worth it when the model does not fit
-  #             (i.e. family: qwen-image-edit on under ~40 GB).
+  #             reload it next turn. Only worth the reload cost when the model
+  #             does not fit (e.g. qwen-image-edit on under ~40 GB).
   #   off       No management at all.
-  mode: "balanced"
+  mode: "auto"
 
   # Cap on MLX's buffer cache. MLX otherwise retains freed GPU buffers
   # indefinitely across sequential denoise passes. Bytes; null disables.

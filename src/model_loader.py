@@ -82,6 +82,7 @@ class EditModel:
         family: str | ModelFamily = "flux2-klein-edit",
         label: str | None = None,
         memory_mode: str = "low",
+        memory_budget_gb: float | None = None,
         cache_limit_bytes: int | None = 1024**3,
         vae_tiling: bool = True,
         quantize: int | None = None,
@@ -93,6 +94,10 @@ class EditModel:
         self.family = family if isinstance(family, ModelFamily) else get_family(family)
         self._label = label
         self.memory_mode = memory_mode
+        # Hard ceiling on device memory. Set on discrete GPUs, where there is
+        # no swap to fall back on; left None on unified memory, where the OS
+        # pages instead of failing.
+        self.memory_budget_gb = memory_budget_gb
         self.cache_limit_bytes = cache_limit_bytes
         self.vae_tiling = vae_tiling
         self.quantize = quantize
@@ -159,6 +164,7 @@ class EditModel:
                     f"installed and recent enough? Run: pip install -r requirements.txt\n{exc}"
                 ) from exc
 
+            self._preflight()
             self._apply_mlx_limits()
             self._report(
                 progress,
@@ -213,11 +219,62 @@ class EditModel:
             return None
 
     def _apply_mlx_limits(self) -> None:
-        if self.memory_mode == "off" or self.cache_limit_bytes is None:
-            return
-        from .device import apply_memory_settings
+        if self.memory_mode != "off" and self.cache_limit_bytes is not None:
+            from .device import apply_memory_settings
 
-        apply_memory_settings(self.cache_limit_bytes)
+            apply_memory_settings(self.cache_limit_bytes)
+
+        # On a discrete GPU an over-allocation surfaces as an uncaught C++
+        # abort from the CUDA allocator ("cudaMallocAsync ... out of memory"),
+        # which kills the whole process. Giving MLX an explicit limit turns
+        # that into a Python exception we can catch and explain.
+        if self.memory_budget_gb:
+            try:
+                import mlx.core as mx
+
+                limit = int(self.memory_budget_gb * 0.92 * 1024**3)
+                mx.set_memory_limit(limit)
+                logger.debug("MLX memory limit set to %.1f GB", limit / 1024**3)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Could not set the MLX memory limit: %s", exc)
+
+    def _preflight(self) -> None:
+        """Refuse a model that cannot fit, instead of dying mid-generation.
+
+        Only applies where there is a hard ceiling (discrete GPU). On unified
+        memory an oversized model is slow rather than fatal, which is a
+        judgement for the user rather than a blocker.
+        """
+        budget = self.memory_budget_gb
+        if not budget:
+            return
+
+        needed = (
+            self.family.denoise_peak_gb
+            if self.memory_mode == "low"
+            else self.family.working_set_gb
+        )
+        # Activations, latents, and the VAE decode need room beyond the weights.
+        headroom = 2.0
+        if needed + headroom <= budget:
+            return
+
+        mode_hint = (
+            ""
+            if self.memory_mode == "low"
+            else "\n  - Set memory.mode: low, which frees the text encoder "
+            "after encoding."
+        )
+        raise ModelLoadError(
+            f"{self.family.label} needs about {needed:.1f} GB of GPU memory "
+            f"(plus ~{headroom:.0f} GB for activations), but only "
+            f"{budget:.1f} GB is available.\n"
+            f"Options:{mode_hint}\n"
+            f"  - Choose a smaller model — FLUX.2 Klein 4B needs ~7 GB.\n"
+            f"  - Reduce the resolution preset.\n"
+            f"This check exists because exceeding GPU memory aborts the process "
+            f"from inside the CUDA allocator rather than raising an error."
+        )
 
     def _enable_vae_tiling(self, model: Any) -> None:
         """Tile VAE encode/decode so activations don't spike at high resolution."""
@@ -408,6 +465,44 @@ class EditModel:
     def after_generation(self) -> None:
         """Housekeeping between edits: drop MLX's freed-buffer cache."""
         self._collect()
+
+    def switch_to(
+        self,
+        repo_id: str,
+        family: str | ModelFamily,
+        *,
+        label: str | None = None,
+        memory_mode: str | None = None,
+        progress: ProgressFn | None = None,
+    ) -> None:
+        """Swap in a different model, unloading the current one first.
+
+        Unloading before loading matters: holding both would need the sum of
+        two working sets, which is exactly the condition being avoided.
+
+        No-op when the requested model is already active, so re-selecting from
+        the UI does not pay a reload.
+        """
+        resolved = family if isinstance(family, ModelFamily) else get_family(family)
+
+        with self._lock:
+            if repo_id == self.repo_id and resolved.key == self.family.key:
+                logger.debug("Model %s is already active.", repo_id)
+                return
+
+            previous = self.label
+            self._report(progress, "Unloading", previous)
+            self.unload()
+
+            self.repo_id = repo_id
+            self.family = resolved
+            self._label = label
+            self._model_root = None
+            self._load_seconds = None
+            if memory_mode is not None:
+                self.memory_mode = memory_mode
+
+            logger.info("Switched model: %s -> %s", previous, self.label)
 
     def unload(self) -> None:
         """Release the whole model. Used on shutdown or a hard reset."""

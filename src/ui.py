@@ -31,6 +31,7 @@ from .inference import (
     InferenceError,
     memory_snapshot,
 )
+from .families import get_family
 from .model_loader import EditModel, is_model_cached
 from .session import EditSession
 from .utils import (
@@ -248,6 +249,60 @@ class EditorUI:
     def on_stop(self) -> str:
         self._cancel.set()
         return "Stopping after the current step…"
+
+    def on_model_change(self, label: str) -> tuple[Any, Any, Any, Any]:
+        """Switch models from the picker.
+
+        Returns (status, steps, guidance, negative-prompt visibility) — the
+        generation defaults differ per family, so they move with the model
+        rather than silently staying wrong.
+        """
+        entry = self._entry_for_label(label)
+        if entry is None:
+            return gr.update(), gr.update(), gr.update(), gr.update()
+
+        if self.editor.is_busy:
+            gr.Warning("An edit is running. Wait for it to finish before switching models.")
+            return gr.update(), gr.update(), gr.update(), gr.update()
+
+        family = get_family(entry.family)
+        mode = self.config.memory.resolve(
+            family.working_set_gb, self.device.usable_memory_gb
+        )
+
+        try:
+            self.model.switch_to(
+                entry.repo_id, family, label=entry.label, memory_mode=mode
+            )
+        except Exception as exc:  # noqa: BLE001 - keep the UI alive
+            gr.Warning(f"Could not switch model: {exc}")
+            return gr.update(), gr.update(), gr.update(), gr.update()
+
+        self.config.model.active = entry.id
+        cached = is_model_cached(entry.repo_id, self.config.model.cache_dir, family)
+        note = (
+            f"{entry.label} selected · {family.working_set_gb:.0f} GB · memory mode {mode}"
+        )
+        if not cached:
+            note += f" · downloads ~{family.working_set_gb:.0f} GB on the next edit"
+        gr.Info(note)
+
+        return (
+            note,
+            gr.update(value=family.default_steps),
+            gr.update(
+                value=family.default_guidance,
+                minimum=family.guidance_range[0],
+                maximum=family.guidance_range[1],
+            ),
+            gr.update(visible=family.supports_negative_prompt),
+        )
+
+    def _entry_for_label(self, label: str):
+        for entry in self.config.model.catalog:
+            if entry.describe(self.device.usable_memory_gb) == label:
+                return entry
+        return None
 
     def on_random_seed(self) -> int:
         return random_seed()
@@ -498,7 +553,9 @@ class EditorUI:
         cfg = self.config
         gen = cfg.generation
         rec = gen.m5_recommended
-        cached = is_model_cached(cfg.model.repo_id, cfg.model.cache_dir)
+        entry = cfg.model.active_entry
+        family = get_family(entry.family)
+        cached = is_model_cached(entry.repo_id, cfg.model.cache_dir, family)
 
         with gr.Blocks(title=cfg.ui.title) as demo:
             session_state = gr.State(None)
@@ -527,6 +584,20 @@ class EditorUI:
                         sources=["upload", "clipboard"],
                     )
 
+                    model_choices = [
+                        e.describe(self.device.usable_memory_gb)
+                        for e in cfg.model.catalog
+                    ]
+                    model_picker = gr.Dropdown(
+                        choices=model_choices,
+                        value=cfg.model.active_entry.describe(
+                            self.device.usable_memory_gb
+                        ),
+                        label="Model",
+                        info="Switching unloads the current model. Weights "
+                             "download on first use.",
+                    )
+
                     with gr.Accordion("Settings", open=False):
                         resolution = gr.Dropdown(
                             choices=[p.label for p in gen.resolution_presets],
@@ -537,14 +608,16 @@ class EditorUI:
                             width = gr.Number(label="Width", value=None, precision=0)
                             height = gr.Number(label="Height", value=None, precision=0)
                         steps = gr.Slider(
-                            4, 60, value=int(rec.get("steps", gen.steps)), step=1,
+                            4, 60, value=int(rec.get("steps", family.default_steps)), step=1,
                             label="Steps",
                             info="More steps = more detail, linearly more time.",
                         )
                         guidance = gr.Slider(
-                            1.0, 10.0, value=float(rec.get("guidance", gen.guidance)),
+                            family.guidance_range[0], family.guidance_range[1],
+                            value=float(rec.get("guidance", family.default_guidance)),
                             step=0.1, label="Guidance",
-                            info="How strictly to follow the instruction. 2.5-4.5 works well.",
+                            info="How strictly to follow the instruction. "
+                                 "FLUX.2 wants ~1.0; Qwen ~4.0.",
                         )
                         with gr.Row():
                             seed_box = gr.Number(
@@ -559,6 +632,9 @@ class EditorUI:
                             value=gen.negative_prompt,
                             placeholder="blurry, low quality, distorted…",
                             lines=2,
+                            # FLUX.2 rejects a negative prompt outright, so the
+                            # field is hidden rather than silently ignored.
+                            visible=family.supports_negative_prompt,
                         )
                         gr.Markdown(
                             f"<span class='qe-hint'>Recommended for "
@@ -645,6 +721,11 @@ class EditorUI:
 
             resolution.change(
                 self.on_resolution_change, inputs=resolution, outputs=[width, height]
+            )
+            model_picker.change(
+                self.on_model_change,
+                inputs=model_picker,
+                outputs=[status, steps, guidance, negative],
             )
             random_btn.click(self.on_random_seed, outputs=seed_box)
 
