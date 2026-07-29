@@ -1,0 +1,25 @@
+# Qwen Image Edit — Apple Silicon (M5)
+#
+# macOS on Apple Silicon only. Nothing here is CUDA- or NVIDIA-specific.
+# Python 3.11+ required; 3.12 is what this was developed and tested against.
+
+# MLX implementation of Qwen-Image-Edit. Pulls in mlx, transformers, tokenizers,
+# safetensors, huggingface-hub, and (as a transitive dependency) torch.
+# mflux runs the model on the Apple GPU through Metal — the only path that
+# supports 6-bit weights on Apple Silicon today.
+mflux==0.18.0
+
+# Web UI. Gradio 6 is required: the app uses gr.ImageSlider and the Gradio 6
+# Chatbot messages format, and passes css/theme to launch() rather than Blocks().
+gradio>=6.0,<7.0
+
+# Configuration and image IO.
+PyYAML>=6.0
+Pillow>=11.0
+
+# FastAPI backs the optional local REST API. Gradio already depends on it; it is
+# listed explicitly because src/api.py imports it directly.
+fastapi>=0.115
+
+# Tests only — safe to skip in a runtime-only install.
+pytest>=8.0

@@ -1,0 +1,115 @@
+# Qwen Image Edit — Apple Silicon (M5) configuration
+#
+# Every path may use ~ and ${ENV_VAR}. Relative paths resolve against this
+# file's directory, so the project stays portable.
+
+model:
+  # Pre-quantized 6-bit Qwen-Image-Edit-2509 in mflux/MLX format.
+  # Accepts a HuggingFace repo id ("org/name") or a local directory.
+  #
+  # Note: Norton0924/Qwen-Image-Edit-2509-6bit is the other 6-bit export, but
+  # its text_encoder/2.safetensors is truncated upstream (67 MB against a
+  # header declaring 2.06 GB), so it cannot load. Run `python app.py --verify`
+  # if you swap this for another repo.
+  repo_id: "OsaurusAI/Qwen-Image-Edit-mflux-q6"
+
+  # Where weights are cached. This becomes HF_HOME, so downloads land inside
+  # the project instead of ~/.cache/huggingface. ~32 GB on first launch.
+  cache_dir: "./models/hf"
+
+  # Bit width is read from the model's own safetensors metadata. Leave null to
+  # honour it. Setting an int here is ignored for pre-quantized weights.
+  quantize: null
+
+  # Download at import time instead of on first edit.
+  preload: false
+
+  # Optional LoRA adapters applied to the transformer.
+  # lora_paths:  ["lightx2v/Qwen-Image-Lightning"]
+  # lora_scales: [0.5]
+  lora_paths: []
+  lora_scales: []
+
+memory:
+  # How aggressively to manage the ~32 GB working set (16.6 GB 6-bit
+  # transformer + 15.5 GB bf16 text encoder) on a 24 GB machine.
+  #
+  #   balanced  Keep every component resident. Fastest per-edit once warm;
+  #             relies on macOS paging the idle text encoder out during
+  #             denoising. Recommended for 32 GB+.
+  #   low       Evict the text encoder after each prompt encode and lazily
+  #             reload it next turn. Peak ~17 GB. Costs a reload (~10-25 s)
+  #             on turns that re-encode. Recommended for 24 GB.
+  #   off       No management at all.
+  mode: "low"
+
+  # Cap on MLX's buffer cache. MLX otherwise retains freed GPU buffers
+  # indefinitely across sequential denoise passes. Bytes; null disables.
+  cache_limit_bytes: 1073741824
+
+  # Tile VAE encode/decode to cap activation memory at high resolutions.
+  vae_tiling: true
+
+generation:
+  # Defaults for the UI. Everything here is overridable per-edit.
+  steps: 25
+  guidance: 4.0
+  # null = derive from the input image's aspect ratio at ~1 megapixel.
+  width: null
+  height: null
+  negative_prompt: ""
+  scheduler: "linear"
+
+  # Resolution presets offered in the UI.
+  #
+  # Presets with `megapixels` preserve the source aspect ratio and size to that
+  # pixel budget — the right default, because forcing a square output on a
+  # non-square photo stretches it. Presets with explicit width/height are for
+  # deliberately reframing to a different shape.
+  resolution_presets:
+    - { label: "Draft — match input, 0.3 MP", megapixels: 0.3 }
+    - { label: "Balanced — match input, 0.6 MP", megapixels: 0.6 }
+    - { label: "Quality — match input, 1.0 MP", megapixels: 1.0 }
+    - { label: "Square — 768 x 768", width: 768, height: 768 }
+    - { label: "Square — 1024 x 1024", width: 1024, height: 1024 }
+    - { label: "Portrait — 768 x 1024", width: 768, height: 1024 }
+    - { label: "Landscape — 1024 x 768", width: 1024, height: 768 }
+
+  # Shown in the UI as the recommended starting point for this machine.
+  m5_recommended:
+    steps: 25
+    guidance: 4.0
+    preset: "Balanced — match input, 0.6 MP"
+
+output:
+  dir: "./outputs"
+  # Written next to each PNG: prompt, seed, steps, guidance, timing.
+  save_metadata: true
+  # Persist edit sessions so they survive an app restart.
+  save_sessions: true
+  format: "png"
+
+ui:
+  title: "Qwen Image Edit — M5"
+  server_name: "127.0.0.1"
+  server_port: 7860
+  share: false
+  # Open the browser automatically on launch.
+  inbrowser: true
+  # Preset one-tap instructions shown under the composer.
+  style_presets:
+    - { label: "Cinematic", prompt: "Turn this photo into a cinematic still with dramatic lighting, film grain, and shallow depth of field. Keep the subject and composition unchanged." }
+    - { label: "Golden hour", prompt: "Relight the scene with warm golden-hour sunlight and long soft shadows. Keep everything else unchanged." }
+    - { label: "Watercolour", prompt: "Repaint this image as a soft watercolour illustration with visible paper texture and loose edges." }
+    - { label: "Remove background", prompt: "Remove the background entirely and replace it with a clean, evenly lit plain white studio backdrop. Keep the subject exactly as it is." }
+    - { label: "Black & white", prompt: "Convert to a high-contrast black and white photograph with deep blacks and bright highlights." }
+    - { label: "Enhance", prompt: "Improve the overall quality: sharpen detail, fix exposure, and balance colour. Do not change any content." }
+
+logging:
+  # DEBUG | INFO | WARNING | ERROR
+  level: "INFO"
+  file: "./outputs/app.log"
+
+api:
+  # Local REST endpoints (POST /api/edit) mounted alongside the Gradio app.
+  enabled: true
